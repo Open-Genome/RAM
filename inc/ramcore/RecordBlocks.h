@@ -33,6 +33,10 @@
 /// against 62.9 MB with 5,000 and 58.9 MB with 100,000; for fqzcomp it keeps
 /// all but a percent of 25,000's gain at less than half the decode time.
 constexpr std::size_t kBlockRecords = 10000;
+/// Lossless quality values per block at most, as CRAM caps a slice at 500
+/// bases per record of kBlockRecords. Without it a block of 10,000 PacBio HiFi
+/// reads held 150 MB of qualities, all decoded for a region of one base.
+constexpr std::size_t kBlockBases = 500 * kBlockRecords;
 /// Blocks decoded ahead during a scan. Four keep up with a full dump of fqzcomp
 /// blocks, and each fqzcomp decoder holds a 68 MB model, so more only costs
 /// memory.
@@ -51,7 +55,7 @@ public:
    using FillFn = std::function<void(ROOT::REntry &)>;
 
    BlockWriter(std::unique_ptr<ROOT::REntry> first, std::unique_ptr<ROOT::REntry> second, FillFn fill,
-               std::size_t block_records = kBlockRecords);
+               std::size_t block_records = kBlockRecords, std::size_t block_bases = kBlockBases);
 
    RAMNTupleRecord &Record() { return *m_records.at(m_current); }
    void Add();
@@ -68,6 +72,7 @@ private:
    std::array<std::vector<std::uint8_t> *, 2> m_nameBlobs{};
    FillFn m_fill;
    std::size_t m_blockRecords;
+   std::size_t m_blockBases;
    std::size_t m_current = 0;
    bool m_pending = false;
    std::size_t m_rows = 0;

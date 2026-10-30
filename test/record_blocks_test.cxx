@@ -41,7 +41,7 @@ using Damage = std::function<void(std::vector<std::uint8_t> &)>;
 // Writes the reads; \p ends, when given, replaces the block ends, and \p damage
 // changes every quality block, as in a damaged file.
 void Write(const std::vector<Read> &reads, std::size_t block, uint32_t policy, const std::vector<uint64_t> &ends = {},
-           const Damage &damage = nullptr)
+           const Damage &damage = nullptr, std::size_t bases = kBlockBases)
 {
    std::unique_ptr<TFile> file(TFile::Open(kFile, "RECREATE"));
    RAMFileMetadata meta;
@@ -56,7 +56,7 @@ void Write(const std::vector<Read> &reads, std::size_t block, uint32_t policy, c
                damage(blob);
             writer->Fill(e);
          },
-         block);
+         block, bases);
       for (const auto &read : reads) {
          RAMNTupleRecord &rec = out.Record();
          rec.SetBit(policy);
@@ -140,6 +140,19 @@ TEST_F(RecordBlocksTest, EveryQualityComesBackInAnyOrder)
             EXPECT_TRUE(view(row).qual.empty()) << "row " << row;
       }
    }
+}
+
+// A block also ends once it holds that many quality values, as a CRAM slice
+// of long reads ends on bases, and the qualities come back across the ends.
+TEST_F(RecordBlocksTest, BlocksOfLongReadsEndOnBases)
+{
+   const std::vector<Read> reads = {{0, std::string(20, 'I')}, {0x10, std::string(20, '#')}, {0, "*"},
+                                    {0, std::string(5, 'F')},  {0, std::string(30, '5')},    {0, "AB"}};
+   Write(reads, /*block=*/100, kRansPolicy, /*ends=*/{}, /*damage=*/nullptr, /*bases=*/25);
+   const auto written = RAMFile::Open(kFile);
+   ASSERT_NE(written, nullptr);
+   EXPECT_EQ(written->GetMetadata().block_ends, (std::vector<uint64_t>{1, 4, 5}));
+   ExpectQualities(reads, {5, 0, 3, 1, 4, 2});
 }
 
 // Lossless qualities go into blocks by default, compressed with rANS; with

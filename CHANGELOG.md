@@ -50,6 +50,14 @@ the README for what that means before 1.0.
   since it holds every reference's buffers at once. Peak memory with
   `-threads 4` grows by about 100 MB (651 to 756 MB on the Illumina reads).
   The format is unchanged.
+- A block of names and qualities also ends once it holds 5 million quality
+  values, as CRAM ends a slice at 500 bases per read. A block of 10,000 PacBio
+  HiFi reads held 150 MB of qualities, all decoded for a region of one base.
+  On 5 Mb of chr20 of HG002 Revio, a 100 bp region printed as SAM takes 0.10 s
+  instead of 0.82 s when converted from BAM (0.09 s instead of 0.22 s from
+  SAM), the peak memory of the conversion falls from 558 to 316 MB, and the
+  file size is the same. Short-read files are unchanged byte for byte. The
+  format is unchanged.
 - `samtoramntuple -threads N` holds up to N + 1 blocks of 64 MB in memory
   instead of 2N + 1. On 2 million records of chromosome 11 the peak goes from
   695 to 426 MB on 4 threads and from 1052 to 725 MB on 8, in the same time
