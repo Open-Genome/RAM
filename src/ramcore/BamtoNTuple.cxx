@@ -12,16 +12,17 @@
 #include <TStopwatch.h>
 
 #include <htslib/hts.h>
+#include <htslib/kstring.h>
 #include <htslib/sam.h>
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cstdint>
-#include <cstdio>
-#include <cstring>
 #include <iostream>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
@@ -72,97 +73,23 @@ std::string GetCigar(const bam1_t *b)
    return s;
 }
 
-std::string FormatTag(const char *name, char type_char, const std::string &value)
-{
-   std::string result;
-   result.reserve(strlen(name) + 3 + value.size());
-   result += name;
-   result += ':';
-   result += type_char;
-   result += ':';
-   result += value;
-   return result;
-}
-
+// Every aux field as SAM text, formatted by htslib as samtools view prints it.
 std::vector<std::string> GetTags(const bam1_t *b)
 {
    std::vector<std::string> tags;
-   const uint8_t *aux = bam_get_aux(b);
-   const uint8_t *end = b->data + b->l_data;
-
-   while (aux < end) {
-      const std::array<char, 3> tag = {static_cast<char>(aux[0]), static_cast<char>(aux[1]), '\0'};
-      aux += 2;
-      const char type = static_cast<char>(*aux++);
-
-      switch (type) {
-      case 'A':
-         tags.emplace_back(FormatTag(tag.data(), 'A', std::string(1, static_cast<char>(*aux))));
-         aux += 1;
-         break;
-      case 'c': {
-         tags.emplace_back(FormatTag(tag.data(), 'i', std::to_string(static_cast<int8_t>(*aux))));
-         aux += 1;
-         break;
-      }
-      case 'C': {
-         tags.emplace_back(FormatTag(tag.data(), 'i', std::to_string(*aux)));
-         aux += 1;
-         break;
-      }
-      case 's': {
-         int16_t v{};
-         memcpy(&v, aux, sizeof(v));
-         tags.emplace_back(FormatTag(tag.data(), 'i', std::to_string(v)));
-         aux += sizeof(v);
-         break;
-      }
-      case 'S': {
-         uint16_t v{};
-         memcpy(&v, aux, sizeof(v));
-         tags.emplace_back(FormatTag(tag.data(), 'i', std::to_string(v)));
-         aux += sizeof(v);
-         break;
-      }
-      case 'i': {
-         int32_t v{};
-         memcpy(&v, aux, sizeof(v));
-         tags.emplace_back(FormatTag(tag.data(), 'i', std::to_string(v)));
-         aux += sizeof(v);
-         break;
-      }
-      case 'I': {
-         uint32_t v{};
-         memcpy(&v, aux, sizeof(v));
-         tags.emplace_back(FormatTag(tag.data(), 'i', std::to_string(v)));
-         aux += sizeof(v);
-         break;
-      }
-      case 'f': {
-         float v{};
-         memcpy(&v, aux, sizeof(v));
-         // Must match htslib's rendering exactly, or a converted record no
-         // longer compares equal to the BAM it came from. htslib formats
-         // float aux values with "%g" (6 significant digits, trailing zeros
-         // stripped, scientific notation where shorter); std::to_string uses
-         // "%f" and always emits 6 decimal places, turning htslib's
-         // "pa:f:0.862" into "pa:f:0.862000".
-         char buf[32];
-         std::snprintf(buf, sizeof(buf), "%g", static_cast<double>(v));
-         tags.emplace_back(FormatTag(tag.data(), 'f', buf));
-         aux += sizeof(v);
-         break;
-      }
-      case 'Z':
-      case 'H': {
-         const char *str = static_cast<const char *>(static_cast<const void *>(aux));
-         tags.emplace_back(FormatTag(tag.data(), type, str));
-         aux += strlen(str) + 1;
-         break;
-      }
-      default: return tags;
-      }
+   kstring_t text = KS_INITIALIZE;
+   const std::unique_ptr<kstring_t, void (*)(kstring_t *)> freeText(&text, [](kstring_t *ks) { ks_free(ks); });
+   for (const uint8_t *s = bam_aux_first(b); s != nullptr; s = bam_aux_next(b, s)) {
+      ks_clear(&text);
+      // The key, type and value around s, as htslib's own bam_aux_get_str() passes them.
+      // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+      if (sam_format_aux1(s - 2, *s, s + 1, b->data + b->l_data, &text) == nullptr)
+         throw std::runtime_error(std::string("cannot read the tags of ") + bam_get_qname(b));
+      tags.emplace_back(text.s, text.l);
    }
+   // The walk ends with ENOENT after the last field and EINVAL on a damaged one.
+   if (errno == EINVAL)
+      throw std::runtime_error(std::string("damaged tags in ") + bam_get_qname(b));
    return tags;
 }
 

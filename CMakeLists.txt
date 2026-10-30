@@ -31,7 +31,7 @@ include(${ROOT_USE_FILE})
 
 # Find htslib
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(htslib REQUIRED IMPORTED_TARGET htslib)
+pkg_check_modules(htslib REQUIRED IMPORTED_TARGET htslib>=1.17)
 
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_SOURCE_DIR}/cmake/modules)
 include(RamtoolsHtscodecs)
