@@ -222,6 +222,7 @@ def check(args):
 def files(work, name):
     stem = STEM if name == "chr20" else f"{STEM}_{SUBSETS[name]}"
     return {"sam": work / f"{stem}.sam", "bam": work / f"{stem}.bam", "cram": work / f"{stem}.cram",
+            "cram_noref": work / f"{stem}.noref.cram",
             "regions": work / f"{stem}.regions.json", "ref": work / "GRCh38.chr20.fa"}
 
 
@@ -314,14 +315,17 @@ def verify_records(bam, region, accept):
 
 
 def write_cram(f, threads, log):
-    """The same records as CRAM 3.1 with samtools' default profile, for the yardstick."""
-    if f["cram"].exists():
-        return
-    part = f["cram"].with_suffix(".part.cram")
-    check_call(["samtools", "view", "--no-PG", "-C", "--output-fmt-option", "version=3.1", "-T", f["ref"],
-                "-@", threads, "-o", part, f["bam"]], log=log)
-    part.rename(f["cram"])
-    check_call(["samtools", "index", f["cram"]], log=log)
+    """The same records as CRAM 3.1 with samtools' default profile, for the yardstick: once
+    against the reference, and once with embed_ref=2, which stores a consensus of each
+    slice's reads instead, so that like a RAM file it reads without a reference."""
+    for key, options in (("cram", ["-T", f["ref"]]), ("cram_noref", ["--output-fmt-option", "embed_ref=2"])):
+        if f[key].exists():
+            continue
+        part = f[key].with_suffix(".part.cram")
+        check_call(["samtools", "view", "--no-PG", "-C", "--output-fmt-option", "version=3.1", *options,
+                    "-@", threads, "-o", part, f["bam"]], log=log)
+        part.rename(f[key])
+        check_call(["samtools", "index", f[key]], log=log)
 
 
 def write_subset(sam, out, regions, n):
@@ -573,7 +577,7 @@ def storage(ram):
 def run(args):
     work = Path(args.work)
     f = files(work, args.input)
-    if not all(f[k].exists() for k in ("sam", "bam", "cram", "regions", "ref")):
+    if not all(f[k].exists() for k in ("sam", "bam", "cram", "cram_noref", "regions", "ref")):
         say("the data is not all there; fetching it first")
         fetch(args)
     if not check(args):
@@ -663,7 +667,8 @@ def run(args):
     fields = {s: storage(readable[s]) for s in builds}
     doc = {"protocol": PROTOCOL, "measured_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
            "env": environment(pin), "input": {"name": args.input, "sam_md5": md5_of_file(sam), "regions": regions,
-                                              "bam_size": bam.stat().st_size, "cram_size": cram.stat().st_size},
+                                              "bam_size": bam.stat().st_size, "cram_size": cram.stat().st_size,
+                                              "cram_noref_size": f["cram_noref"].stat().st_size},
            "threads": args.threads, "repeats": reps, "builds": {s: info for s, (info, _) in builds.items()},
            "steps": steps, "samtools": yard, "sizes": sizes, "fields": fields, "correctness": correctness}
     results = Path(args.results or work / "results")
@@ -770,6 +775,8 @@ def render(doc):
         if old and new:
             lines.append(f"| {label} | {mb(old)} | {mb(new)} | {pct(old, new)} |")
     lines += [f"| samtools BAM | {mb(inp['bam_size'])} | | |", f"| samtools CRAM 3.1 | {mb(inp['cram_size'])} | | |"]
+    if "cram_noref_size" in inp:
+        lines.append(f"| samtools CRAM 3.1, embed_ref=2 | {mb(inp['cram_noref_size'])} | | |")
     fb, fh = doc["fields"]["base"], doc["fields"]["head"]
     if fb or fh:
         lines += ["", "By field, on storage:", "", "| field | base | head | change |", "|---|---:|---:|---:|"]

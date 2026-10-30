@@ -61,7 +61,11 @@ another md5 for the SAM. It writes, in `--work`:
 - `NA12878.chr20.sam`: `samtools view --no-PG -h` of the BAM, about 9 GB.
 - `NA12878.chr20.cram`: CRAM 3.1 with samtools' default profile, indexed, for
   the comparison with samtools.
-- The first 2,000,000 and 50,000 records of the SAM, each also as BAM and CRAM.
+- `NA12878.chr20.noref.cram`: the same with `embed_ref=2`, which stores a
+  consensus of each slice's reads instead of pointing at the reference, so
+  that like a RAM file it reads without one. The report gives its size next to
+  the other.
+- The first 2,000,000 and 50,000 records of the SAM, each also as BAM and both CRAMs.
 
 `--no-PG` keeps the commands out of the header, so every machine gets the same
 files: the report gives the md5 of the SAM it measured.
