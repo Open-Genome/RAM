@@ -40,6 +40,16 @@ the README for what that means before 1.0.
 
 ### Changed
 
+- The converters write RNTuple's default pages of up to 1 MiB instead of
+  64 KB, so ZSTD sees more than four long reads at a time. On 5 Mb of chr20
+  converted from SAM, HG002 PacBio Revio reads go from 64.4 to 46.5 MB (28%
+  smaller) and HG00154 Illumina reads at 30x from 83.4 to 80.1 MB (4%), with
+  45 to 49% less conversion CPU on Revio. A 100 bp region printed as SAM takes
+  23 ms longer on the Illumina reads (0.071 to 0.094 s) and no longer on
+  Revio; larger regions and full dumps are faster. `-split` keeps 64 KB pages,
+  since it holds every reference's buffers at once. Peak memory with
+  `-threads 4` grows by about 100 MB (651 to 756 MB on the Illumina reads).
+  The format is unchanged.
 - `samtoramntuple -threads N` holds up to N + 1 blocks of 64 MB in memory
   instead of 2N + 1. On 2 million records of chromosome 11 the peak goes from
   695 to 426 MB on 4 threads and from 1052 to 725 MB on 8, in the same time

@@ -164,7 +164,6 @@ void bamtoramntuple(const char *bamfile, const char *treefile, bool /*split*/, b
    auto model = RAMNTupleRecord::MakeModel();
    ROOT::RNTupleWriteOptions opts;
    opts.SetCompression(compression_algorithm);
-   opts.SetMaxUnzippedPageSize(64000);
 
    auto writer = ROOT::RNTupleWriter::Append(std::move(model), "RAM", *rootFile, opts);
    BlockWriter out(writer->GetModel().CreateEntry(), writer->GetModel().CreateEntry(),
