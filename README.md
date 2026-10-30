@@ -194,6 +194,21 @@ NA12878 at 30x (17.7 million records, 1000 Genomes high coverage), it takes
 1.3 s of CPU on one thread. `samtools flagstat` takes 9.4 s on the BAM and
 3.9 s on the CRAM 3.1, from which it also decodes only the fields it needs.
 
+## Bytes per field
+
+`ramstats size` prints how many bytes each field takes, the way
+`samtools cram-size` does for a CRAM: a line per field with its bytes on disk,
+its bytes before compression and its share of the file, then the total.
+
+```bash
+./build/tools/ramstats size reads.ram
+```
+
+It reads only the sizes RNTuple keeps for every page, so it takes the same
+time for any file. `nameblock` and `qualblock` hold the read names and the
+lossless qualities, already coded with tok3 and rANS (or fqzcomp) before
+ROOT compresses them.
+
 ## Checking a RAM file against samtools
 
 A RAM file holds everything the input did, so it can be written back out and

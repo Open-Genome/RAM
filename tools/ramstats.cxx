@@ -3,10 +3,14 @@
 // same reads, from counts the converter stored, without reading a record.
 // `ramstats flagstat file.ram` prints what `samtools flagstat` prints, reading
 // only the flag, refid, refnext and mapq columns.
+// `ramstats size file.ram` prints the bytes each field takes, as samtools
+// cram-size does for CRAM, from the page sizes RNTuple stores.
 
 #include "rntuple/RAMFile.h"
 #include "rntuple/RAMNTupleRecord.h"
 
+#include <ROOT/RNTupleDescriptor.hxx>
+#include <ROOT/RNTupleInspector.hxx>
 #include <ROOT/RNTupleReader.hxx>
 #include <ROOT/RNTupleTypes.hxx>
 #include <ROOT/RNTupleView.hxx>
@@ -28,11 +32,16 @@ void Usage()
 {
    std::cerr << "Usage: ramstats idxstats <in.ram>\n"
              << "       ramstats flagstat [-O default|tsv|json] <in.ram>\n"
+             << "       ramstats size <in.ram>\n"
              << "\nidxstats prints a line per reference, as samtools idxstats does: the name,\n"
              << "the length, the mapped and the unmapped records, then '*' and the records\n"
              << "with no reference.\n"
              << "\nflagstat counts the records by their FLAG bits, QC-passed and QC-failed\n"
-             << "apart, and prints the counts in samtools flagstat's text, TSV or JSON.\n";
+             << "apart, and prints the counts in samtools flagstat's text, TSV or JSON.\n"
+             << "\nsize prints a line per field: its name, its bytes on disk, its bytes before\n"
+             << "compression and its share of the bytes on disk, then the total. nameblock\n"
+             << "and qualblock hold the names and qualities already coded with tok3 and\n"
+             << "rANS or fqzcomp, so their bytes before compression are those codecs' output.\n";
 }
 
 // LN of every @SQ line by SN, as written in the header.
@@ -324,6 +333,46 @@ int Flagstat(const std::vector<std::string> &args)
    return 0;
 }
 
+// ramstats size <in.ram>; the arguments after "size". A line per member of the
+// record and per other field, from the sizes RNTuple keeps for every page, so
+// nothing is read or decompressed.
+int Size(const std::vector<std::string> &args)
+{
+   if (args.size() != 1) {
+      Usage();
+      return 1;
+   }
+   if (!RAMFile::Open(args[0])) {
+      std::cerr << "ramstats: cannot open " << args[0] << "\n";
+      return 1;
+   }
+   const auto inspector = ROOT::Experimental::RNTupleInspector::Create("RAM", args[0]);
+   const ROOT::RNTupleDescriptor &desc = inspector->GetDescriptor();
+   std::vector<ROOT::DescriptorId_t> fields;
+   for (const auto &top : desc.GetTopLevelFields()) {
+      if (top.GetFieldName() != "record") {
+         fields.push_back(top.GetId());
+         continue;
+      }
+      for (const auto &member : desc.GetFieldIterable(top))
+         fields.push_back(member.GetId());
+   }
+
+   const std::uint64_t total = inspector->GetCompressedSize();
+   std::ostringstream out;
+   out << std::fixed << std::setprecision(1);
+   for (const ROOT::DescriptorId_t id : fields) {
+      const auto &field = inspector->GetFieldTreeInspector(id);
+      const double share =
+         total == 0 ? 0.0 : 100.0 * static_cast<double>(field.GetCompressedSize()) / static_cast<double>(total);
+      out << desc.GetQualifiedFieldName(id) << '\t' << field.GetCompressedSize() << '\t' << field.GetUncompressedSize()
+          << '\t' << share << "%\n";
+   }
+   out << "total\t" << total << '\t' << inspector->GetUncompressedSize() << "\t100.0%\n";
+   std::cout << out.str();
+   return 0;
+}
+
 int Run(const std::vector<std::string> &args)
 {
    if (args.size() == 1 && args[0] == "--help") {
@@ -332,6 +381,8 @@ int Run(const std::vector<std::string> &args)
    }
    if (!args.empty() && args[0] == "flagstat")
       return Flagstat(std::vector<std::string>(args.begin() + 1, args.end()));
+   if (!args.empty() && args[0] == "size")
+      return Size(std::vector<std::string>(args.begin() + 1, args.end()));
    if (args.size() != 2 || args[0] != "idxstats") {
       Usage();
       return 1;

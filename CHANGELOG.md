@@ -33,6 +33,10 @@ the README for what that means before 1.0.
   (17.7 million records) it takes 1.3 s of CPU and 20 MB on one thread, against
   9.4 s for `samtools flagstat` on the BAM and 3.9 s on the CRAM 3.1. The file
   format is unchanged ([#108]).
+- `ramstats size` prints the bytes each field takes on disk and before
+  compression, as `samtools cram-size` does for CRAM, so the size of a RAM file
+  can be compared field by field. It reads only the page sizes RNTuple stores
+  and decompresses nothing. The file format is unchanged.
 
 ### Changed
 

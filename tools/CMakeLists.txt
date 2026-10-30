@@ -29,6 +29,7 @@ ROOT_EXECUTABLE(ramstats
         ramcore
         ROOT::Core
         ROOT::ROOTNTuple
+        ROOT::ROOTNTupleUtil
 )
 
 ROOT_EXECUTABLE(bamtoramntuple
