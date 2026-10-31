@@ -1,4 +1,4 @@
-# Builds without ROOT. Needs zstd, the xxHash header and htscodecs, from
+# Builds without ROOT. Needs htslib, zstd, the xxHash header and htscodecs, from
 # pkg-config or from its source: make HTSCODECS=<htscodecs source directory>.
 CFLAGS ?= -O2 -g
 WARNINGS = -std=c11 -D_POSIX_C_SOURCE=200809L -D_FILE_OFFSET_BITS=64 \
@@ -15,11 +15,14 @@ CODECS_CFLAGS = $(shell pkg-config --cflags htscodecs)
 CODECS_LIBS = $(shell pkg-config --libs htscodecs)
 endif
 
-ramread: ramread.o rntuple.o $(CODECS_OBJ)
-	$(CC) $(LDFLAGS) -o $@ $^ -lzstd $(CODECS_LIBS)
+HTSLIB_CFLAGS = $(shell pkg-config --cflags htslib)
+HTSLIB_LIBS = $(shell pkg-config --libs htslib)
 
-ramread.o rntuple.o: %.o: %.c rntuple.h
-	$(CC) $(WARNINGS) $(CODECS_CFLAGS) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+ramread: ramread.o ram.o rntuple.o $(CODECS_OBJ)
+	$(CC) $(LDFLAGS) -o $@ $^ $(HTSLIB_LIBS) -lzstd $(CODECS_LIBS)
+
+ramread.o ram.o rntuple.o: %.o: %.c ram.h rntuple.h
+	$(CC) $(WARNINGS) $(HTSLIB_CFLAGS) $(CODECS_CFLAGS) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
 
 $(CODECS_OBJ): %.o: $(HTSCODECS)/htscodecs/%.c
 	@mkdir -p codecs && touch codecs/config.h
