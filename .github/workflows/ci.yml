@@ -49,6 +49,14 @@ jobs:
         cd build
         ctest --output-on-failure --build-config Release
 
+    - name: Check the ROOT-free reader against ramdump
+      run: |
+        sudo apt-get install -y libzstd-dev libxxhash-dev
+        # The htscodecs the CMake build used: its own copy when there is no system one.
+        if [ -d build/_deps/htscodecs-src ]; then make -C libram HTSCODECS=$PWD/build/_deps/htscodecs-src; else make -C libram; fi
+        source thisroot.sh
+        libram/check.sh build/tools libram/ramread
+
   coverage:
     name: Code Coverage
     runs-on: ubuntu-24.04
