@@ -17,6 +17,7 @@ tmp/
 *.bk
 *.rootix
 build/
+libram/ramread
 cmake-build-*/
 Build/
 BUILD/
