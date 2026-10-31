@@ -2,11 +2,15 @@
 // that the dump reproduces the input and that its counts follow samtools' rules.
 #include <gtest/gtest.h>
 #include <array>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <map>
 #include <memory>
+#include <sstream>
 #include <string>
+#include <utility>
 
 namespace {
 
@@ -208,6 +212,36 @@ TEST_F(RamdumpTest, IdxstatsFollowsSamtools)
    EXPECT_NE(Quiet(ramstats), 0);
    EXPECT_NE(Quiet(ramstats + " depth " + kRamFile), 0);
    EXPECT_NE(Quiet(ramstats + " idxstats missing.root"), 0);
+}
+
+// Every field has a line, and the fields add up to the total, before and after
+// compression.
+TEST_F(RamdumpTest, SizeAddsUpToTheTotal)
+{
+   const std::string ramstats = RAMSTATS_BIN;
+   std::istringstream lines(Output(ramstats + " size " + kRamFile));
+   std::map<std::string, std::pair<uint64_t, uint64_t>> fields;
+   std::string name{};
+   uint64_t compressed = 0;
+   uint64_t uncompressed = 0;
+   std::string share{};
+   while (lines >> name >> compressed >> uncompressed >> share)
+      fields[name] = {compressed, uncompressed};
+
+   ASSERT_EQ(fields.count("total"), 1U);
+   const auto total = fields.at("total");
+   fields.erase("total");
+   for (const char *field : {"record.seq", "record.cigar", "record.tag_nm", "qualblock", "nameblock"})
+      EXPECT_EQ(fields.count(field), 1U) << field;
+   std::pair<uint64_t, uint64_t> sum{};
+   for (const auto &[field, size] : fields) {
+      sum.first += size.first;
+      sum.second += size.second;
+   }
+   EXPECT_GT(total.first, 0U);
+   EXPECT_EQ(sum, total);
+   EXPECT_NE(Quiet(ramstats + " size"), 0);
+   EXPECT_NE(Quiet(ramstats + " size missing.root"), 0);
 }
 
 // Every case bam_stat.c tells apart: proper and improper pairs, a singleton,
