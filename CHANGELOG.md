@@ -122,6 +122,14 @@ the README for what that means before 1.0.
   readers pass `RAMFile::MateOnSameRef()` to `GetPNEXT()` and `GetTLEN()`
   ([#113]).
 
+### Fixed
+
+- `bamtoramntuple` dropped a record's tags from the first `B` (array) tag on:
+  PacBio's `ML:B:C` comes first, so every HG002 Revio record lost all fifteen
+  of its tags without a warning. Tags are now formatted by htslib, as
+  `samtools view` prints them, and both a Revio and an Illumina BAM come back
+  byte for byte. htslib 1.17 or newer is required, for its aux iterator.
+
 ## [0.1.0] - 2026-10-14
 
 The first tagged release. RAMTools began in 2017 at CERN openlab as a format

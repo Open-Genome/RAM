@@ -73,7 +73,7 @@ void GenerateRichBAMFile(const char *bam_path)
 
    bam1_t *rec = bam_init1();
 
-   // Mapped read with all aux tag types: A, c, C, s, S, i, I, f, Z, H
+   // Mapped read with all aux tag types: B, c, C, s, S, i, I, f, A, Z, H
    {
       const char *qname = "read_tags";
       const char *seq = "ACGTACGTACGT";
@@ -83,6 +83,10 @@ void GenerateRichBAMFile(const char *bam_path)
       std::array<uint32_t, 1> cigar = {static_cast<uint32_t>(len) << 4 | 0};
 
       bam_set1(rec, strlen(qname), qname, 0, 0, 1000, 60, 1, cigar.data(), -1, -1, 0, len, seq, qual.c_str(), 128);
+
+      // First, so a converter that stops at a type it does not know loses every tag.
+      std::array<uint8_t, 3> val_B = {1, 2, 255};
+      bam_aux_update_array(rec, "XB", 'C', val_B.size(), val_B.data());
 
       int8_t val_c = -5;
       bam_aux_append(rec, "Xc", 'c', sizeof(val_c), reinterpret_cast<const uint8_t *>(&val_c));
@@ -284,7 +288,7 @@ TEST_F(BamToNTupleTest, TagsOfEveryTypeComeBackAsSamtoolsPrintsThem)
          EXPECT_EQ(rec.tag_xs, 50000);
       }
    }
-   EXPECT_EQ(tags, "\tXc:i:-5\tXC:i:200\tXs:i:-1000\tXS:i:50000\tXi:i:-100000\tXI:i:3000000\tXf:f:3.14"
+   EXPECT_EQ(tags, "\tXB:B:C,1,2,255\tXc:i:-5\tXC:i:200\tXs:i:-1000\tXS:i:50000\tXi:i:-100000\tXI:i:3000000\tXf:f:3.14"
                    "\tXA:A:Q\tXZ:Z:hello\tXH:H:1AE301");
 }
 
