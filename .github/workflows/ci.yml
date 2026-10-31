@@ -55,7 +55,7 @@ jobs:
         # The htscodecs the CMake build used: its own copy when there is no system one.
         if [ -d build/_deps/htscodecs-src ]; then make -C libram HTSCODECS=$PWD/build/_deps/htscodecs-src; else make -C libram; fi
         # samtools reading RAM through libram and htslib-ram.patch.
-        sudo apt-get install -y autoconf
+        sudo apt-get install -y autoconf libbz2-dev liblzma-dev libcurl4-gnutls-dev zlib1g-dev
         libram/htslib.sh "$RUNNER_TEMP/hts"
         source thisroot.sh
         libram/check.sh build/tools libram/ramread "$RUNNER_TEMP/hts/samtools/samtools"
