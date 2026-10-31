@@ -150,10 +150,11 @@ void CheckBlockEnds(const std::vector<uint64_t> &ends, ROOT::NTupleSize_t rows)
 } // namespace
 
 BlockWriter::BlockWriter(std::unique_ptr<ROOT::REntry> first, std::unique_ptr<ROOT::REntry> second, FillFn fill,
-                         std::size_t block_records)
+                         std::size_t block_records, std::size_t block_bases)
    : m_entries{std::move(first), std::move(second)},
      m_fill(std::move(fill)),
-     m_blockRecords(std::max<std::size_t>(block_records, 1))
+     m_blockRecords(std::max<std::size_t>(block_records, 1)),
+     m_blockBases(block_bases)
 {
    for (std::size_t i = 0; i < 2; i++) {
       m_records.at(i) = m_entries.at(i)->GetPtr<RAMNTupleRecord>("record").get();
@@ -193,7 +194,7 @@ void BlockWriter::Add()
       m_fill(*m_entries.at(1 - m_current));
    m_pending = true;
    m_current = 1 - m_current;
-   if (m_rows == m_blockRecords)
+   if (m_rows == m_blockRecords || m_quals.size() >= m_blockBases)
       Finish();
 }
 
