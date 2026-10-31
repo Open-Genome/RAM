@@ -5,6 +5,7 @@
 #include <zstd.h>
 
 #include <inttypes.h>
+#include <setjmp.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -12,24 +13,13 @@
 #include <string.h>
 #include <sys/stat.h>
 
-void rnt_die(const char *fmt, ...)
-{
-   va_list ap;
-   va_start(ap, fmt);
-   fputs("ramread: ", stderr);
-   vfprintf(stderr, fmt, ap);
-   fputc('\n', stderr);
-   va_end(ap);
-   exit(1);
-}
+static _Noreturn void die(RntFile *f, const char *fmt, ...);
 
-#define die rnt_die
-
-static void *xrealloc(void *p, size_t n)
+static void *xrealloc(RntFile *f, void *p, size_t n)
 {
    void *q = realloc(p, n ? n : 1);
    if (q == NULL)
-      die("out of memory");
+      die(f, "out of memory");
    return q;
 }
 
@@ -37,12 +27,13 @@ static void *xrealloc(void *p, size_t n)
 typedef struct {
    const uint8_t *p;
    size_t n, off;
+   RntFile *f;
 } Buf;
 
 static const uint8_t *take(Buf *c, size_t n)
 {
    if (n > c->n - c->off)
-      die("truncated record");
+      die(c->f, "truncated record");
    const uint8_t *q = c->p + c->off;
    c->off += n;
    return q;
@@ -51,7 +42,7 @@ static const uint8_t *take(Buf *c, size_t n)
 static void seek(Buf *c, uint64_t off)
 {
    if (off > c->n)
-      die("offset past the end of a record");
+      die(c->f, "offset past the end of a record");
    c->off = (size_t)off;
 }
 
@@ -75,8 +66,10 @@ static uint64_t be(Buf *c, size_t n)
 
 static uint64_t le64_at(const uint8_t *q)
 {
-   Buf c = {q, 8, 0};
-   return le(&c, 8);
+   uint64_t v = 0;
+   for (size_t i = 8; i-- > 0;)
+      v = (v << 8) | q[i];
+   return v;
 }
 
 /* A ROOT TString: one length byte, or 255 followed by a 32-bit big-endian length. */
@@ -94,7 +87,7 @@ static char *ntstring(Buf *c)
 {
    const size_t n = (size_t)le(c, 4);
    const uint8_t *s = take(c, n);
-   char *out = xrealloc(NULL, n + 1);
+   char *out = xrealloc(c->f, NULL, n + 1);
    memcpy(out, s, n);
    out[n] = '\0';
    return out;
@@ -108,11 +101,11 @@ static size_t frame(Buf *c, int want_list, uint32_t *nitems)
    const int is_list = size < 0;
    const uint64_t len = is_list ? (uint64_t)0 - (uint64_t)size : (uint64_t)size;
    if (is_list != want_list)
-      die("expected a %s frame", want_list ? "list" : "record");
+      die(c->f, "expected a %s frame", want_list ? "list" : "record");
    if (is_list)
       *nitems = (uint32_t)le(c, 4);
    if (len > c->n - start || start + len < c->off)
-      die("bad frame size");
+      die(c->f, "bad frame size");
    return start + (size_t)len;
 }
 
@@ -136,6 +129,9 @@ struct RntColumn {
 struct RntFile {
    FILE *f;
    uint64_t size;
+   jmp_buf *trap; /* where an error unwinds to */
+   char err[256]; /* the first error, or empty */
+   void *tmp[3];  /* buffers that live only while an envelope or a page is read */
    char **names;
    uint32_t *parents;
    uint32_t nfields;
@@ -144,59 +140,115 @@ struct RntFile {
    uint64_t entries;
 };
 
-static uint8_t *read_at(const RntFile *f, uint64_t off, uint64_t n)
+/* Errors unwind with longjmp to the trap that rnt_open or the loading of a page set. Every buffer belongs to
+   the file, to a cursor or to the file's temporaries, so nothing leaks on the way. */
+static void set_error(RntFile *f, const char *fmt, va_list ap)
+{
+   if (f->err[0] == '\0')
+      vsnprintf(f->err, sizeof f->err, fmt, ap);
+}
+
+static _Noreturn void die(RntFile *f, const char *fmt, ...)
+{
+   va_list ap;
+   va_start(ap, fmt);
+   set_error(f, fmt, ap);
+   va_end(ap);
+   if (f->trap == NULL)
+      abort();
+   longjmp(*f->trap, 1);
+}
+
+/* Records the first error without unwinding; the cursors return zeros from then on. */
+static void fail(RntFile *f, const char *fmt, ...)
+{
+   va_list ap;
+   va_start(ap, fmt);
+   set_error(f, fmt, ap);
+   va_end(ap);
+}
+
+static void *temporary(RntFile *f, size_t n)
+{
+   for (size_t i = 0; i < sizeof f->tmp / sizeof *f->tmp; ++i) {
+      if (f->tmp[i] == NULL)
+         return f->tmp[i] = xrealloc(f, NULL, n);
+   }
+   abort();
+}
+
+/* Frees a temporary, or with keep, hands it to the caller. */
+static void release(RntFile *f, void *p, int keep)
+{
+   for (size_t i = 0; i < sizeof f->tmp / sizeof *f->tmp; ++i) {
+      if (f->tmp[i] == p && p != NULL)
+         f->tmp[i] = NULL;
+   }
+   if (!keep)
+      free(p);
+}
+
+static void free_temporaries(RntFile *f)
+{
+   for (size_t i = 0; i < sizeof f->tmp / sizeof *f->tmp; ++i) {
+      free(f->tmp[i]);
+      f->tmp[i] = NULL;
+   }
+}
+
+static uint8_t *read_at(RntFile *f, uint64_t off, uint64_t n)
 {
    if (off > f->size || n > f->size - off)
-      die("range %" PRIu64 "+%" PRIu64 " is past the end of the file", off, n);
-   uint8_t *buf = xrealloc(NULL, (size_t)n);
+      die(f, "range %" PRIu64 "+%" PRIu64 " is past the end of the file", off, n);
+   uint8_t *buf = temporary(f, (size_t)n);
    if (fseeko(f->f, (off_t)off, SEEK_SET) != 0 || fread(buf, 1, (size_t)n, f->f) != n)
-      die("cannot read %" PRIu64 " bytes at %" PRIu64, n, off);
+      die(f, "cannot read %" PRIu64 " bytes at %" PRIu64, n, off);
    return buf;
 }
 
 /* Undoes ROOT's compression blocks: chunks of a 9-byte header and the compressed bytes. */
-static uint8_t *unzip(uint8_t *in, size_t nin, size_t nout)
+static uint8_t *unzip(RntFile *f, uint8_t *in, size_t nin, size_t nout)
 {
    if (nin == nout)
       return in;
-   uint8_t *out = xrealloc(NULL, nout);
+   uint8_t *out = temporary(f, nout);
    size_t i = 0;
    size_t o = 0;
    while (o < nout) {
       if (nin - i < 9)
-         die("truncated compression block");
+         die(f, "truncated compression block");
       const uint8_t *h = in + i;
       const size_t csize = (size_t)h[3] | (size_t)h[4] << 8 | (size_t)h[5] << 16;
       const size_t usize = (size_t)h[6] | (size_t)h[7] << 8 | (size_t)h[8] << 16;
       if (h[0] != 'Z' || h[1] != 'S')
-         die("compression %c%c is not supported, only zstd", h[0], h[1]);
+         die(f, "compression %c%c is not supported, only zstd", h[0], h[1]);
       if (csize > nin - i - 9 || usize > nout - o)
-         die("bad compression block");
+         die(f, "bad compression block");
       if (ZSTD_decompress(out + o, usize, h + 9, csize) != usize)
-         die("zstd failed");
+         die(f, "zstd failed");
       i += 9 + csize;
       o += usize;
    }
    if (i != nin)
-      die("bad compression block");
-   free(in);
+      die(f, "bad compression block");
+   release(f, in, 0);
    return out;
 }
 
 /* Reads an envelope, checks its type and checksum, and leaves the cursor on its payload. */
 static uint8_t *
-envelope(const RntFile *f, uint64_t at, uint64_t nbytes, uint64_t len, unsigned type, Buf *c, uint64_t *checksum)
+envelope(RntFile *f, uint64_t at, uint64_t nbytes, uint64_t len, unsigned type, Buf *c, uint64_t *checksum)
 {
    if (len < 16 || len > SIZE_MAX)
-      die("bad envelope length");
-   uint8_t *buf = unzip(read_at(f, at, nbytes), (size_t)nbytes, (size_t)len);
+      die(f, "bad envelope length");
+   uint8_t *buf = unzip(f, read_at(f, at, nbytes), (size_t)nbytes, (size_t)len);
    const uint64_t ck = le64_at(buf + len - 8);
    if (XXH3_64bits(buf, (size_t)len - 8) != ck)
-      die("envelope %u checksum mismatch", type);
-   *c = (Buf){buf, (size_t)len - 8, 0};
+      die(f, "envelope %u checksum mismatch", type);
+   *c = (Buf){buf, (size_t)len - 8, 0, f};
    const uint64_t id = le(c, 8);
    if ((id & 0xffff) != type || id >> 16 != len)
-      die("expected envelope %u of %" PRIu64 " bytes", type, len);
+      die(f, "expected envelope %u of %" PRIu64 " bytes", type, len);
    if (checksum)
       *checksum = ck;
    return buf;
@@ -214,7 +266,7 @@ static Locator locator(Buf *c)
    /* Non-standard: 16 bits of locator size, 8 reserved, then the type as a negative 8-bit number. */
    const int type = -(int)(int8_t)(uint8_t)((uint32_t)head >> 24);
    if (type != 1 || ((uint32_t)head & 0xffff) != 20)
-      die("locator type %d is not supported", type);
+      die(c->f, "locator type %d is not supported", type);
    const uint64_t size = le(c, 8);
    return (Locator){size, le(c, 8)};
 }
@@ -222,7 +274,7 @@ static Locator locator(Buf *c)
 static void check_features(Buf *c)
 {
    if (le(c, 8) != 0)
-      die("the file uses RNTuple features this reader does not know");
+      die(c->f, "the file uses RNTuple features this reader does not know");
 }
 
 /* The four list frames of a schema description, in the header or its extension in the footer. */
@@ -231,9 +283,9 @@ static void schema(Buf *c, RntFile *f)
    uint32_t n = 0;
    size_t end = frame(c, 1, &n);
    if (n > c->n)
-      die("bad field count");
-   f->names = xrealloc(f->names, (f->nfields + n) * sizeof *f->names);
-   f->parents = xrealloc(f->parents, (f->nfields + n) * sizeof *f->parents);
+      die(f, "bad field count");
+   f->names = xrealloc(f, f->names, (f->nfields + n) * sizeof *f->names);
+   f->parents = xrealloc(f, f->parents, (f->nfields + n) * sizeof *f->parents);
    for (uint32_t i = 0; i < n; ++i) {
       const size_t fend = frame(c, 0, NULL);
       take(c, 8); /* field and type version */
@@ -246,8 +298,8 @@ static void schema(Buf *c, RntFile *f)
 
    end = frame(c, 1, &n);
    if (n > c->n)
-      die("bad column count");
-   f->columns = xrealloc(f->columns, (f->ncolumns + n) * sizeof *f->columns);
+      die(f, "bad column count");
+   f->columns = xrealloc(f, f->columns, (f->ncolumns + n) * sizeof *f->columns);
    for (uint32_t i = 0; i < n; ++i) {
       const size_t cend = frame(c, 0, NULL);
       RntColumn *col = &f->columns[f->ncolumns++];
@@ -256,7 +308,7 @@ static void schema(Buf *c, RntFile *f)
       take(c, 2); /* bits on storage */
       col->field = (uint32_t)le(c, 4);
       if (le(c, 2) & 1)
-         die("deferred columns are not supported");
+         die(f, "deferred columns are not supported");
       col->repr = (uint16_t)le(c, 2);
       c->off = cend;
    }
@@ -269,21 +321,21 @@ static void schema(Buf *c, RntFile *f)
 }
 
 /* Finds the key of the RNTuple called name in the top directory and returns the offset of its object. */
-static uint64_t find_anchor(const RntFile *f, const char *name, uint64_t *objlen)
+static uint64_t find_anchor(RntFile *f, const char *name, uint64_t *objlen)
 {
    uint8_t *hb = read_at(f, 0, f->size < 64 ? f->size : 64);
-   Buf c = {hb, f->size < 64 ? (size_t)f->size : 64, 0};
+   Buf c = {hb, f->size < 64 ? (size_t)f->size : 64, 0, f};
    if (memcmp(take(&c, 4), "root", 4) != 0)
-      die("not a ROOT file");
+      die(f, "not a ROOT file");
    take(&c, 4); /* version */
    const uint64_t begin = be(&c, 4);
-   free(hb);
+   release(f, hb, 0);
    if (begin >= f->size)
-      die("bad file header");
+      die(f, "bad file header");
 
    /* The top directory: its key, the file's name and title, then the streamed TDirectory. */
    uint8_t *db = read_at(f, begin, f->size - begin < 512 ? f->size - begin : 512);
-   c = (Buf){db, f->size - begin < 512 ? (size_t)(f->size - begin) : 512, 0};
+   c = (Buf){db, f->size - begin < 512 ? (size_t)(f->size - begin) : 512, 0, f};
    take(&c, 14);
    seek(&c, be(&c, 2)); /* key length */
    const uint8_t *s = NULL;
@@ -297,11 +349,11 @@ static uint64_t find_anchor(const RntFile *f, const char *name, uint64_t *objlen
    const size_t w = dir_version > 1000 ? 8 : 4;
    take(&c, 2 * w); /* seek dir, seek parent */
    const uint64_t seek_keys = be(&c, w);
-   free(db);
+   release(f, db, 0);
 
    /* The key list: a key of its own, the number of keys, then each key's header. */
    uint8_t *kb = read_at(f, seek_keys, nbytes_keys);
-   c = (Buf){kb, (size_t)nbytes_keys, 0};
+   c = (Buf){kb, (size_t)nbytes_keys, 0, f};
    take(&c, 14);
    seek(&c, be(&c, 2));
    const uint64_t nkeys = be(&c, 4);
@@ -330,19 +382,19 @@ static uint64_t find_anchor(const RntFile *f, const char *name, uint64_t *objlen
          *objlen = len_obj;
       }
    }
-   free(kb);
+   release(f, kb, 0);
    if (at == 0)
-      die("no RNTuple called %s", name);
+      die(f, "no RNTuple called %s", name);
 
    /* The object follows the key's own header. */
    uint8_t *ab = read_at(f, at, 18);
-   c = (Buf){ab, 18, 0};
+   c = (Buf){ab, 18, 0, f};
    const uint64_t nbytes = be(&c, 4);
    take(&c, 10);
    const uint64_t keylen = be(&c, 2);
-   free(ab);
+   release(f, ab, 0);
    if (nbytes < keylen || nbytes - keylen != *objlen)
-      die("compressed anchors are not supported");
+      die(f, "compressed anchors are not supported");
    return at + keylen;
 }
 
@@ -350,7 +402,7 @@ static uint64_t find_anchor(const RntFile *f, const char *name, uint64_t *objlen
 static void page_list(RntFile *f, Buf *p, uint64_t header_ck, uint32_t first_cluster)
 {
    if (le(p, 8) != header_ck)
-      die("page list belongs to another header");
+      die(f, "page list belongs to another header");
    uint32_t n = 0;
    size_t end = frame(p, 1, &n);
    for (uint32_t i = 0; i < n; ++i) {
@@ -358,7 +410,7 @@ static void page_list(RntFile *f, Buf *p, uint64_t header_ck, uint32_t first_clu
       take(p, 8); /* first entry */
       const uint64_t entries = le(p, 8);
       if (entries >> 56 & 1)
-         die("sharded clusters are not supported");
+         die(f, "sharded clusters are not supported");
       f->entries += entries & ((1ULL << 56) - 1);
       p->off = send;
    }
@@ -370,16 +422,16 @@ static void page_list(RntFile *f, Buf *p, uint64_t header_ck, uint32_t first_clu
       uint32_t ncols = 0;
       const size_t cols_end = frame(p, 1, &ncols);
       if (ncols != f->ncolumns)
-         die("a cluster has %u columns, the schema %u", ncols, f->ncolumns);
+         die(f, "a cluster has %u columns, the schema %u", ncols, f->ncolumns);
       for (uint32_t i = 0; i < ncols; ++i) {
          RntColumn *col = &f->columns[i];
          if (col->nclusters != first_cluster + k)
-            die("page lists out of order");
+            die(f, "page lists out of order");
          uint32_t npages = 0;
          const size_t pages_end = frame(p, 1, &npages);
          if (npages > p->n)
-            die("bad page count");
-         col->pages = xrealloc(col->pages, (col->npages + npages) * sizeof *col->pages);
+            die(f, "bad page count");
+         col->pages = xrealloc(f, col->pages, (col->npages + npages) * sizeof *col->pages);
          Page *first = col->pages + col->npages;
          uint64_t elements = 0;
          for (uint32_t pg = 0; pg < npages; ++pg) {
@@ -396,8 +448,8 @@ static void page_list(RntFile *f, Buf *p, uint64_t header_ck, uint32_t first_clu
          }
          const int64_t offset = (int64_t)le(p, 8);
          if (offset < 0)
-            die("suppressed columns are not supported");
-         col->cluster_first = xrealloc(col->cluster_first, (col->nclusters + 1) * sizeof *col->cluster_first);
+            die(f, "suppressed columns are not supported");
+         col->cluster_first = xrealloc(f, col->cluster_first, (col->nclusters + 1) * sizeof *col->cluster_first);
          col->cluster_first[col->nclusters++] = (uint64_t)offset;
          for (uint32_t pg = 0; pg < npages; ++pg)
             first[pg].first += (uint64_t)offset;
@@ -408,29 +460,27 @@ static void page_list(RntFile *f, Buf *p, uint64_t header_ck, uint32_t first_clu
    p->off = clusters_end;
 }
 
-RntFile *rnt_open(const char *path, const char *name)
+static void parse(RntFile *f, const char *path, const char *name)
 {
-   RntFile *f = xrealloc(NULL, sizeof *f);
-   memset(f, 0, sizeof *f);
    f->f = fopen(path, "rb");
    struct stat st;
    if (f->f == NULL || fstat(fileno(f->f), &st) != 0)
-      die("cannot open %s", path);
+      die(f, "cannot open %s", path);
    f->size = (uint64_t)st.st_size;
 
    /* The anchor: big-endian, with an XXH3 over everything after byte count and class version. */
    uint64_t objlen = 0;
    const uint64_t at = find_anchor(f, name, &objlen);
    if (objlen < 78)
-      die("anchor too short");
+      die(f, "anchor too short");
    uint8_t *ab = read_at(f, at, objlen);
-   Buf c = {ab, (size_t)objlen, 0};
+   Buf c = {ab, (size_t)objlen, 0, f};
    seek(&c, objlen - 8);
    if (XXH3_64bits(ab + 6, (size_t)objlen - 14) != be(&c, 8))
-      die("anchor checksum mismatch");
+      die(f, "anchor checksum mismatch");
    seek(&c, 6);
    if (be(&c, 2) != 1)
-      die("RNTuple epoch is not 1");
+      die(f, "RNTuple epoch is not 1");
    take(&c, 6); /* major, minor, patch */
    const uint64_t seek_header = be(&c, 8);
    const uint64_t nbytes_header = be(&c, 8);
@@ -438,7 +488,7 @@ RntFile *rnt_open(const char *path, const char *name)
    const uint64_t seek_footer = be(&c, 8);
    const uint64_t nbytes_footer = be(&c, 8);
    const uint64_t len_footer = be(&c, 8);
-   free(ab);
+   release(f, ab, 0);
 
    uint64_t header_ck = 0;
    uint8_t *hb = envelope(f, seek_header, nbytes_header, len_header, 1, &c, &header_ck);
@@ -446,19 +496,19 @@ RntFile *rnt_open(const char *path, const char *name)
    for (int i = 0; i < 3; ++i)
       free(ntstring(&c)); /* name, description, writer */
    schema(&c, f);
-   free(hb);
+   release(f, hb, 0);
 
    uint8_t *fb = envelope(f, seek_footer, nbytes_footer, len_footer, 2, &c, NULL);
    check_features(&c);
    if (le(&c, 8) != header_ck)
-      die("footer belongs to another header");
+      die(f, "footer belongs to another header");
    const size_t ext_end = frame(&c, 0, NULL);
    if (c.off < ext_end)
       schema(&c, f);
    c.off = ext_end;
    for (uint32_t i = 0; i < f->ncolumns; ++i) {
       if (f->columns[i].field >= f->nfields || f->columns[i].repr != 0)
-         die("column %u is not supported", i);
+         die(f, "column %u is not supported", i);
    }
 
    uint32_t ngroups = 0;
@@ -474,16 +524,36 @@ RntFile *rnt_open(const char *path, const char *name)
       Buf p;
       uint8_t *pb = envelope(f, pl.offset, pl.size, len_pl, 3, &p, NULL);
       page_list(f, &p, header_ck, clusters);
-      free(pb);
+      release(f, pb, 0);
       clusters += nclusters;
    }
    c.off = groups_end;
-   free(fb);
+   release(f, fb, 0);
+}
+
+RntFile *rnt_open(const char *path, const char *name, char *err, size_t errlen)
+{
+   /* volatile: GCC cannot see that f stays the same across the longjmp. */
+   RntFile *volatile f = calloc(1, sizeof *f);
+   if (f == NULL) {
+      snprintf(err, errlen, "out of memory");
+      return NULL;
+   }
+   jmp_buf trap;
+   f->trap = &trap;
+   if (setjmp(trap) != 0) {
+      snprintf(err, errlen, "%s", f->err);
+      rnt_close(f);
+      return NULL;
+   }
+   parse(f, path, name);
+   f->trap = NULL;
    return f;
 }
 
 void rnt_close(RntFile *f)
 {
+   free_temporaries(f);
    for (uint32_t i = 0; i < f->nfields; ++i)
       free(f->names[i]);
    for (uint32_t i = 0; i < f->ncolumns; ++i) {
@@ -493,7 +563,8 @@ void rnt_close(RntFile *f)
    free(f->names);
    free(f->parents);
    free(f->columns);
-   fclose(f->f);
+   if (f->f)
+      fclose(f->f);
    free(f);
 }
 
@@ -502,7 +573,12 @@ uint64_t rnt_entries(const RntFile *f)
    return f->entries;
 }
 
-const RntColumn *rnt_column(const RntFile *f, const char *path, unsigned which)
+const char *rnt_error(const RntFile *f)
+{
+   return f->err[0] ? f->err : NULL;
+}
+
+const RntColumn *rnt_column(RntFile *f, const char *path, unsigned which)
 {
    int64_t parent = -1;
    for (const char *p = path; *p;) {
@@ -515,8 +591,10 @@ const RntColumn *rnt_column(const RntFile *f, const char *path, unsigned which)
          if (under && strlen(f->names[i]) == len && memcmp(f->names[i], p, len) == 0)
             found = i;
       }
-      if (found < 0)
-         die("no field %s", path);
+      if (found < 0) {
+         fail(f, "no field %s", path);
+         return NULL;
+      }
       parent = found;
       p += len + (dot != NULL);
    }
@@ -524,7 +602,8 @@ const RntColumn *rnt_column(const RntFile *f, const char *path, unsigned which)
       if (f->columns[i].field == (uint64_t)parent && which-- == 0)
          return &f->columns[i];
    }
-   die("field %s has no such column", path);
+   fail(f, "field %s has no such column", path);
+   return NULL;
 }
 
 /* How the column type stores an element: its size in memory, and whether it is split, zigzag, delta, signed,
@@ -558,16 +637,24 @@ static Encoding encoding(uint16_t type)
    case 0x16: return (Encoding){8, 1, 0, 0, 0, 0, 0};
    case 0x1A: return (Encoding){4, 1, 0, 1, 0, 1, 0};
    case 0x1B: return (Encoding){8, 1, 0, 1, 0, 1, 0};
-   default: die("column type 0x%02x is not supported", type);
+   default: return (Encoding){0, 0, 0, 0, 0, 0, 0};
    }
 }
 
-void rnt_cursor(RntCursor *c, const RntFile *f, const RntColumn *col)
+/* What a cursor reads when its column is missing or not supported: a column of bytes that has no pages. */
+static const RntColumn kNoColumn = {0x01, 0, 0, NULL, 0, NULL, 0};
+
+void rnt_cursor(RntCursor *c, RntFile *f, const RntColumn *col)
 {
    memset(c, 0, sizeof *c);
    c->file = f;
-   c->col = col;
-   encoding(col->type);
+   c->col = &kNoColumn;
+   if (col == NULL)
+      fail(f, "no such column");
+   else if (encoding(col->type).size == 0)
+      fail(f, "column type 0x%02x is not supported", col->type);
+   else
+      c->col = col;
 }
 
 void rnt_cursor_free(RntCursor *c)
@@ -577,46 +664,47 @@ void rnt_cursor_free(RntCursor *c)
    memset(c, 0, sizeof *c);
 }
 
-/* Loads the next page of the cursor's column and decodes its elements. */
-static void load(RntCursor *c)
+/* Reads the next page of the cursor's column and decodes its elements. */
+static void read_page(RntCursor *c)
 {
+   RntFile *f = c->file;
    const RntColumn *col = c->col;
    if (c->page == col->npages)
-      die("a column ends before its last entry");
+      die(f, "a column ends before its last entry");
    const Page *pg = &col->pages[c->page];
    const Encoding e = encoding(col->type);
    c->consumed += c->n;
    if (pg->first != c->consumed)
-      die("the pages of a column do not follow each other");
+      die(f, "the pages of a column do not follow each other");
    if (c->page == 0 || pg->cluster != c->cluster)
       c->prev = 0;
    c->cluster = pg->cluster;
    c->page++;
 
-   if (pg->nelem > (1U << 30) / e.size || pg->size > UINT64_MAX - 8)
-      die("bad page size");
+   if (e.size == 0 || pg->nelem > (1U << 30) / e.size || pg->size > UINT64_MAX - 8)
+      die(f, "bad page size");
    const size_t n = pg->nelem;
-   uint8_t *raw = read_at(c->file, pg->offset, pg->size + (pg->checksum ? 8 : 0));
+   uint8_t *raw = read_at(f, pg->offset, pg->size + (pg->checksum ? 8 : 0));
    if (pg->checksum && XXH3_64bits(raw, (size_t)pg->size) != le64_at(raw + pg->size))
-      die("page checksum mismatch at %" PRIu64, pg->offset);
-   uint8_t *page = unzip(raw, (size_t)pg->size, e.bit ? (n + 7) / 8 : n * e.size);
+      die(f, "page checksum mismatch at %" PRIu64, pg->offset);
+   uint8_t *page = unzip(f, raw, (size_t)pg->size, e.bit ? (n + 7) / 8 : n * e.size);
    c->n = n;
    c->at = 0;
    if (e.bit) {
       /* Eight to a byte, the first in the lowest bit. */
-      free(c->bytes);
-      c->bytes = xrealloc(NULL, n);
+      c->bytes = xrealloc(f, c->bytes, n);
       for (size_t i = 0; i < n; ++i)
          c->bytes[i] = (uint8_t)(page[i / 8] >> (i % 8) & 1);
-      free(page);
+      release(f, page, 0);
       return;
    }
    if (e.size == 1) {
       free(c->bytes);
+      release(f, page, 1);
       c->bytes = page;
       return;
    }
-   c->ints = xrealloc(c->ints, (n ? n : 1) * sizeof *c->ints);
+   c->ints = xrealloc(f, c->ints, (n ? n : 1) * sizeof *c->ints);
    const unsigned bits = (unsigned)(8 * e.size);
    for (size_t i = 0; i < n; ++i) {
       uint64_t u = 0;
@@ -631,7 +719,27 @@ static void load(RntCursor *c)
          v = (int64_t)((uint64_t)v + (uint64_t)c->ints[i - 1]);
       c->ints[i] = v;
    }
-   free(page);
+   release(f, page, 0);
+}
+
+/* read_page under a trap: 0 after an error, which leaves the cursor empty. */
+static int load(RntCursor *c)
+{
+   RntFile *f = c->file;
+   if (f->err[0] != '\0')
+      return 0;
+   jmp_buf trap;
+   jmp_buf *const outer = f->trap;
+   f->trap = &trap;
+   if (setjmp(trap) != 0) {
+      free_temporaries(f);
+      f->trap = outer;
+      c->n = c->at = 0;
+      return 0;
+   }
+   read_page(c);
+   f->trap = outer;
+   return 1;
 }
 
 void rnt_seek(RntCursor *c, uint64_t element)
@@ -656,11 +764,14 @@ void rnt_seek(RntCursor *c, uint64_t element)
       return;
    }
    const Page *pg = &col->pages[lo];
-   if (element < pg->first)
-      die("the pages of a column do not follow each other");
+   if (element < pg->first) {
+      fail(c->file, "the pages of a column do not follow each other");
+      return;
+   }
    c->consumed = pg->first;
    c->cluster = pg->cluster;
-   load(c);
+   if (!load(c))
+      return;
    c->at = (size_t)(element - pg->first);
    if (!encoding(col->type).index)
       return;
@@ -669,7 +780,8 @@ void rnt_seek(RntCursor *c, uint64_t element)
       c->prev = c->ints[c->at - 1];
    else if (lo > 0 && col->pages[lo - 1].cluster == pg->cluster) {
       rnt_seek(c, element - 1);
-      c->prev = c->ints[c->at++];
+      if (c->at < c->n)
+         c->prev = c->ints[c->at++];
    }
 }
 
@@ -679,20 +791,26 @@ void rnt_seek_items(RntCursor *items, const RntCursor *index)
       rnt_seek(items, UINT64_MAX);
       return;
    }
-   if (index->page == 0 || index->cluster >= items->col->nclusters)
-      die("seek in a collection before its index");
+   if (index->page == 0 || index->cluster >= items->col->nclusters) {
+      fail(items->file, "seek in a collection before its index");
+      return;
+   }
    rnt_seek(items, items->col->cluster_first[index->cluster] + (uint64_t)index->prev);
 }
 
-static void next(RntCursor *c)
+static int next(RntCursor *c)
 {
-   while (c->at == c->n)
-      load(c);
+   while (c->at == c->n) {
+      if (!load(c))
+         return 0;
+   }
+   return 1;
 }
 
 int64_t rnt_int(RntCursor *c)
 {
-   next(c);
+   if (!next(c))
+      return 0;
    if (encoding(c->col->type).size == 1) {
       const uint8_t b = c->bytes[c->at++];
       return encoding(c->col->type).is_signed ? (int64_t)(int8_t)b : (int64_t)b;
@@ -702,12 +820,17 @@ int64_t rnt_int(RntCursor *c)
 
 uint64_t rnt_len(RntCursor *c)
 {
-   if (!encoding(c->col->type).index)
-      die("not an index column");
-   next(c);
+   if (!encoding(c->col->type).index) {
+      fail(c->file, "not an index column");
+      return 0;
+   }
+   if (!next(c))
+      return 0;
    const int64_t end = c->ints[c->at++];
-   if (end < c->prev)
-      die("collection offsets go backwards");
+   if (end < c->prev) {
+      fail(c->file, "collection offsets go backwards");
+      return 0;
+   }
    const uint64_t len = (uint64_t)(end - c->prev);
    c->prev = end;
    return len;
@@ -716,9 +839,13 @@ uint64_t rnt_len(RntCursor *c)
 void rnt_bytes(RntCursor *c, size_t n, uint8_t *dst)
 {
    if (encoding(c->col->type).size != 1)
-      die("not a column of bytes");
+      fail(c->file, "not a column of bytes");
    while (n > 0) {
-      next(c);
+      if (c->file->err[0] != '\0' || !next(c)) {
+         if (dst)
+            memset(dst, 0, n);
+         return;
+      }
       const size_t k = c->n - c->at < n ? c->n - c->at : n;
       if (dst) {
          memcpy(dst, c->bytes + c->at, k);

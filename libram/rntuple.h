@@ -2,7 +2,10 @@
 
    Follows the RNTuple binary format specification 1.0. Every anchor, envelope
    and page is checked against its XXH3 checksum and every read is bounds
-   checked; a damaged file ends the program with a message on stderr. */
+   checked. A damaged file is an error, never a crash or an exit: rnt_open
+   returns NULL, and once a cursor meets a damaged page every cursor of the
+   file returns zeros and rnt_error says why. An RntFile and its cursors
+   belong to one thread. */
 
 #ifndef LIBRAM_RNTUPLE_H
 #define LIBRAM_RNTUPLE_H
@@ -15,7 +18,7 @@ typedef struct RntColumn RntColumn;
 
 /* Reads one column from its first element to its last, a page at a time. */
 typedef struct {
-   const RntFile *file;
+   RntFile *file;
    const RntColumn *col;
    size_t page; /* the next page to load */
    uint8_t *bytes;
@@ -26,17 +29,19 @@ typedef struct {
    uint64_t consumed; /* elements read before the loaded page */
 } RntCursor;
 
-_Noreturn void rnt_die(const char *fmt, ...);
-
-/* The RNTuple called name in the ROOT file at path. */
-RntFile *rnt_open(const char *path, const char *name);
+/* The RNTuple called name in the ROOT file at path, or NULL with the reason in err. */
+RntFile *rnt_open(const char *path, const char *name, char *err, size_t errlen);
 void rnt_close(RntFile *f);
 uint64_t rnt_entries(const RntFile *f);
+/* The first error met reading the file, or NULL. */
+const char *rnt_error(const RntFile *f);
 
-/* The which-th column (0 the principal one) of the field at a dotted path such as "record.seq". */
-const RntColumn *rnt_column(const RntFile *f, const char *path, unsigned which);
+/* The which-th column (0 the principal one) of the field at a dotted path such as "record.seq", or NULL
+   with an error recorded. */
+const RntColumn *rnt_column(RntFile *f, const char *path, unsigned which);
 
-void rnt_cursor(RntCursor *c, const RntFile *f, const RntColumn *col);
+/* A cursor at the first element of col; with a NULL col, one that only returns zeros. */
+void rnt_cursor(RntCursor *c, RntFile *f, const RntColumn *col);
 void rnt_cursor_free(RntCursor *c);
 /* The next value of an integer column. */
 int64_t rnt_int(RntCursor *c);

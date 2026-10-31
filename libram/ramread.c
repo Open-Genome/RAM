@@ -13,12 +13,39 @@
 #include <htscodecs/tokenise_name3.h>
 
 #include <inttypes.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define die rnt_die
+static _Noreturn void die(const char *fmt, ...)
+{
+   va_list ap;
+   va_start(ap, fmt);
+   fputs("ramread: ", stderr);
+   vfprintf(stderr, fmt, ap);
+   fputc('\n', stderr);
+   va_end(ap);
+   exit(1);
+}
+
+/* Stops at the first error the file met: the cursors return zeros after one. */
+static void check(const RntFile *f)
+{
+   const char *err = rnt_error(f);
+   if (err)
+      die("%s", err);
+}
+
+static RntFile *open_ntuple(const char *path, const char *name)
+{
+   char err[256];
+   RntFile *f = rnt_open(path, name, err, sizeof err);
+   if (f == NULL)
+      die("%s: %s", path, err);
+   return f;
+}
 
 enum {
    kFormatVersion = 8
@@ -98,7 +125,7 @@ typedef struct {
    RntCursor index, chars;
 } StrField;
 
-static void str_field(StrField *f, const RntFile *file, const char *path)
+static void str_field(StrField *f, RntFile *file, const char *path)
 {
    rnt_cursor(&f->index, file, rnt_column(file, path, 0));
    rnt_cursor(&f->chars, file, rnt_column(file, path, 1));
@@ -135,7 +162,7 @@ typedef struct {
    size_t n;
 } Strings;
 
-static Strings meta_strings(const RntFile *meta, const char *name)
+static Strings meta_strings(RntFile *meta, const char *name)
 {
    char path[64];
    snprintf(path, sizeof path, "%s._0", name);
@@ -188,7 +215,7 @@ typedef struct {
    StrField tags;
 } Records;
 
-static void records_open(Records *r, const RntFile *f)
+static void records_open(Records *r, RntFile *f)
 {
    static const char *const ints[4] = {"record.tag_nm", "record.tag_as", "record.tag_xs", "record.tag_mq"};
    static const char *const strs[4] = {"record.tag_md", "record.tag_mc", "record.tag_sa", "record.tag_xa"};
@@ -272,6 +299,7 @@ static size_t read_blob(Block *b, uint64_t rows)
       b->bytes = xrealloc(b->bytes, n);
       rnt_bytes(&b->blob, n, b->bytes);
    }
+   check(b->blob.file);
    return n;
 }
 
@@ -433,7 +461,7 @@ static int32_t parse_region(const char *region, const Strings *rnames, int32_t *
 }
 
 /* The first row at or after (refid, pos) in a sorted file, where unplaced records sort last. */
-static uint64_t first_row_at_or_after(const RntFile *f, uint64_t total, int32_t refid, int32_t pos)
+static uint64_t first_row_at_or_after(RntFile *f, uint64_t total, int32_t refid, int32_t pos)
 {
    RntCursor rc;
    RntCursor pc;
@@ -516,11 +544,12 @@ int main(int argc, char **argv)
       return 2;
    }
 
-   RntFile *meta = rnt_open(path, "METADATA");
+   RntFile *meta = open_ntuple(path, "METADATA");
    RntCursor c;
    rnt_cursor(&c, meta, rnt_column(meta, "format_version", 0));
    const int64_t version = rnt_entries(meta) ? rnt_int(&c) : -1;
    rnt_cursor_free(&c);
+   check(meta);
    if (version != kFormatVersion)
       die("%s has RAM format version %" PRId64 "; this reader reads version %d", path, version, kFormatVersion);
    Strings header_lines = meta_strings(meta, "header_lines");
@@ -546,9 +575,10 @@ int main(int argc, char **argv)
       ends[i] = (uint64_t)rnt_int(&c);
    rnt_cursor_free(&ends_n);
    rnt_cursor_free(&c);
+   check(meta);
    rnt_close(meta);
 
-   RntFile *f = rnt_open(path, "RAM");
+   RntFile *f = open_ntuple(path, "RAM");
    const uint64_t entries = rnt_entries(f);
    for (uint64_t i = 0; i < nblocks; ++i) {
       if ((i > 0 && ends[i] <= ends[i - 1]) || ends[i] >= entries)
@@ -592,6 +622,7 @@ int main(int argc, char **argv)
       rnt_seek_items(&quals.blob, &quals.blob_n);
       rnt_seek(&quals.flags, block_start);
    }
+   check(f);
 
    Str line = {0};
    if (header) {
@@ -753,6 +784,7 @@ int main(int argc, char **argv)
       put_char(&line, '\n');
       if (!keep)
          line.n = line_start;
+      check(f);
       if (line.n >= (1U << 20)) {
          fwrite(line.s, 1, line.n, stdout);
          line.n = 0;
