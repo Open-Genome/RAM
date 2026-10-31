@@ -17,6 +17,9 @@ the README for what that means before 1.0.
   ([#116]). On Linux it runs each command under a small helper it compiles,
   because a command started from Python counted Python's 20 to 30 MB in its
   peak memory: `samtools idxstats` showed 22 to 30 MB instead of 10 ([#117]).
+  The report also gives the size of the CRAM 3.1 written with `embed_ref=2`,
+  which holds a consensus of its reads instead of needing the reference, the
+  fair comparison for a format that reads without one.
 - `-fqzcomp` on both converters compresses lossless quality scores with
   fqzcomp, the codec of CRAM 3.1, in blocks of 10,000 records. On 2 million
   records of chromosome 11 the file is 8.1% smaller, conversion takes 20 to 30%
