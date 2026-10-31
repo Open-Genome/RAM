@@ -26,6 +26,10 @@ CI runs it, so a change to the format or to ROOT's encodings shows up there.
 Features of RNTuple this reader does not know (feature flags, column types,
 compression algorithms) stop it with a message rather than a wrong answer.
 
+`rntuple.c` never exits: a damaged file makes `rnt_open` return NULL with the
+reason, or, met while reading, makes every cursor return zeros and
+`rnt_error` say why, so a caller checks once per record. `ramread` exits with
+that message.
+
 Not done yet: files compressed with anything but ZSTD (the default), and
-writing. A damaged file ends the program with a message rather
-than returning an error to a caller.
+writing.
