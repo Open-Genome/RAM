@@ -38,6 +38,21 @@ SAM. That is `ramdump`'s output byte for byte unless the input spelled a tag
 in a way htslib rewrites, such as `NM:i:007`. A reference the header does not
 list cannot be a `bam1_t`, so a record on one is an error.
 
+## samtools
+
+`htslib.sh <empty directory>` builds htslib and samtools 1.22.1 with libram
+and `htslib-ram.patch`, so that samtools reads a RAM file as it reads a BAM:
+
+    samtools view -c file.ram chr20:30000000-30100000
+    samtools flagstat file.ram
+    samtools view -b -o file.bam file.ram
+
+The patch (about 130 lines) makes `hts_open` recognise a ROOT file as RAM and
+adds RAM to the switches where htslib picks a reader: header, records, close,
+and regions. As for CRAM, the "index" is the open file itself: `ram_query`
+needs no index file. Regions follow samtools here, so `chr20:30000000` runs to
+the end of chr20. Not done: multi-region iterators (`view -M`), and writing.
+
 `check.sh <ramtools build>/tools ./ramread` writes RAM files with each writer
 option and fails if `ramread` prints anything other than what `ramdump` prints,
 as SAM, as BAM read back by samtools, and for a region. CI runs it, so a change
