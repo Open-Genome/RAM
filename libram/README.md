@@ -55,8 +55,10 @@ the end of chr20. Not done: multi-region iterators (`view -M`), and writing.
 
 `check.sh <ramtools build>/tools ./ramread` writes RAM files with each writer
 option and fails if `ramread` prints anything other than what `ramdump` prints,
-as SAM, as BAM read back by samtools, and for a region. CI runs it, so a change
-to the format or to ROOT's encodings shows up there. Features of RNTuple this
+as SAM, as BAM read back by samtools, and for a region; given the samtools
+`htslib.sh` built as a third argument, it checks that one too. CI runs it with
+the patched samtools, so a change to the format, to ROOT's encodings or to
+libram's API shows up there. Features of RNTuple this
 reader does not know (feature flags, column types, compression algorithms)
 stop it with a message rather than a wrong answer.
 

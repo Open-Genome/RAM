@@ -2,10 +2,12 @@
 # Writes RAM files with ROOT and checks that ramread prints exactly what ramdump
 # prints, as SAM, as BAM read back by samtools, and for a region, so a change to
 # the format or to ROOT's encodings fails here first.
-# Usage: check.sh <directory with samtoramntuple and ramdump> <ramread>
+# Given samtools built by htslib.sh, checks that it prints the same too.
+# Usage: check.sh <directory with samtoramntuple and ramdump> <ramread> [<patched samtools>]
 set -eu
 tools=$1
 ramread=$2
+patched=${3:-}
 dir=$(mktemp -d)
 trap 'rm -rf "$dir"' EXIT
 
@@ -48,6 +50,12 @@ for opts in "" -fqzcomp -illumina -dropqual "-threads 4" -split; do
       "$tools/ramdump" -h "$f" chrB:1000000-1500000 > "$dir/want.sam"
       "$ramread" -h "$f" chrB:1000000-1500000 > "$dir/got.sam"
       cmp "$dir/want.sam" "$dir/got.sam" || { echo "ramread differs from ramdump on a region: $opts ${f##*/}"; exit 1; }
+      [ -n "$patched" ] || continue
+      "$patched" view -h --no-PG "$f" chrB:1000000-1500000 > "$dir/got.sam"
+      cmp "$dir/want.sam" "$dir/got.sam" || { echo "patched samtools differs from ramdump on a region: $opts ${f##*/}"; exit 1; }
+      "$tools/ramdump" -h "$f" > "$dir/want.sam"
+      "$patched" view -h --no-PG "$f" > "$dir/got.sam"
+      cmp "$dir/want.sam" "$dir/got.sam" || { echo "patched samtools differs from ramdump: $opts ${f##*/}"; exit 1; }
    done
    echo "ok: ${opts:-default}"
 done
