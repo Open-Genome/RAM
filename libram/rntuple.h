@@ -44,5 +44,9 @@ int64_t rnt_int(RntCursor *c);
 uint64_t rnt_len(RntCursor *c);
 /* The next n elements of a column of bytes or characters, into dst (NULL skips them). */
 void rnt_bytes(RntCursor *c, size_t n, uint8_t *dst);
+/* Moves the cursor to the element at that index in its column: an entry, for a top-level field. */
+void rnt_seek(RntCursor *c, uint64_t element);
+/* Moves items to the first item of the collection that index, just moved with rnt_seek, reads next. */
+void rnt_seek_items(RntCursor *items, const RntCursor *index);
 
 #endif

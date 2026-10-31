@@ -18,6 +18,7 @@ Build, with htscodecs from pkg-config or from its source:
 
     make HTSCODECS=<htscodecs source>   # CPPFLAGS=-I<dir> if xxhash.h is elsewhere
     ./ramread -h file.ram > file.sam
+    ./ramread file.ram chr20:30000000-30100000   # a region, as ramdump reads it
 
 `check.sh <ramtools build>/tools ./ramread` writes RAM files with each writer
 option and fails if `ramread` prints anything other than what `ramdump` prints.
@@ -25,6 +26,6 @@ CI runs it, so a change to the format or to ROOT's encodings shows up there.
 Features of RNTuple this reader does not know (feature flags, column types,
 compression algorithms) stop it with a message rather than a wrong answer.
 
-Not done yet: region queries, files compressed with anything but ZSTD (the
-default), and writing. A damaged file ends the program with a message rather
+Not done yet: files compressed with anything but ZSTD (the default), and
+writing. A damaged file ends the program with a message rather
 than returning an error to a caller.

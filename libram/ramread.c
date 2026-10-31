@@ -4,7 +4,7 @@
    PNEXT and TLEN predictions follow ramtools' RAMNTupleRecord, RAMTags and
    RecordBlocks; a change to those needs the same change here.
 
-   Usage: ramread [-h] <file.ram> */
+   Usage: ramread [-h] <file.ram> [region] */
 
 #include "rntuple.h"
 
@@ -102,6 +102,12 @@ static void str_field(StrField *f, const RntFile *file, const char *path)
 {
    rnt_cursor(&f->index, file, rnt_column(file, path, 0));
    rnt_cursor(&f->chars, file, rnt_column(file, path, 1));
+}
+
+static void str_seek(StrField *f, uint64_t row)
+{
+   rnt_seek(&f->index, row);
+   rnt_seek_items(&f->chars, &f->index);
 }
 
 static void str_free(StrField *f)
@@ -207,6 +213,23 @@ static void records_open(Records *r, const RntFile *f)
    rnt_cursor(&r->tags_n, f, rnt_column(f, "record.tags", 0));
    str_field(&r->tags, f, "record.tags._0");
    rnt_cursor(&r->flags, f, rnt_column(f, "record.compression_flags", 0));
+}
+
+static void records_seek(Records *r, uint64_t row)
+{
+   RntCursor *cursors[] = {&r->flag,        &r->refid,      &r->pos,        &r->mapq,       &r->refnext,
+                           &r->pnext_delta, &r->tlen_delta, &r->tag_int[0], &r->tag_int[1], &r->tag_int[2],
+                           &r->tag_int[3],  &r->tag_rg,     &r->tag_pg,     &r->tag_order,  &r->flags};
+   for (size_t i = 0; i < sizeof cursors / sizeof *cursors; ++i)
+      rnt_seek(cursors[i], row);
+   rnt_seek(&r->cigar_n, row);
+   rnt_seek_items(&r->cigar, &r->cigar_n);
+   StrField *strs[] = {&r->seq, &r->qual, &r->tag_str[0], &r->tag_str[1], &r->tag_str[2], &r->tag_str[3]};
+   for (size_t i = 0; i < sizeof strs / sizeof *strs; ++i)
+      str_seek(strs[i], row);
+   rnt_seek(&r->tags_n, row);
+   rnt_seek_items(&r->tags.index, &r->tags_n);
+   rnt_seek_items(&r->tags.chars, &r->tags.index);
 }
 
 static void records_free(Records *r)
@@ -362,6 +385,81 @@ static void block_free(Block *b)
    free(b->lengths);
 }
 
+static int32_t find_ref(const Strings *rnames, const char *name, size_t len)
+{
+   for (size_t i = 0; i < rnames->n && i <= INT32_MAX; ++i) {
+      if (strlen(rnames->v[i]) == len && memcmp(rnames->v[i], name, len) == 0)
+         return (int32_t)i;
+   }
+   return -1;
+}
+
+/* A position in a region: digits only, at most INT32_MAX; -1 otherwise. */
+static int64_t position(const char *s, size_t n)
+{
+   int64_t v = 0;
+   for (size_t i = 0; i < n; ++i) {
+      if (s[i] < '0' || s[i] > '9' || v > INT32_MAX)
+         return -1;
+      v = v * 10 + (s[i] - '0');
+   }
+   return n > 0 && v <= INT32_MAX ? v : -1;
+}
+
+/* ramntuplescan()'s reading of a region: the whole of it as a reference name, else rname[:start[-end]],
+   1-based and inclusive. Start and end come back 0-based. */
+static int32_t parse_region(const char *region, const Strings *rnames, int32_t *start, int32_t *end)
+{
+   *start = 0;
+   *end = INT32_MAX - 1;
+   int32_t refid = find_ref(rnames, region, strlen(region));
+   if (refid >= 0)
+      return refid;
+   const char *colon = strrchr(region, ':');
+   const size_t name_len = colon ? (size_t)(colon - region) : strlen(region);
+   if (colon) {
+      const char *dash = strchr(colon + 1, '-');
+      const int64_t a = position(colon + 1, dash ? (size_t)(dash - colon - 1) : strlen(colon + 1));
+      const int64_t b = dash ? position(dash + 1, strlen(dash + 1)) : a;
+      if (a < 0 || b < 0)
+         die("invalid region %s: use rname[:start[-end]]", region);
+      *start = a > 0 ? (int32_t)(a - 1) : 0;
+      *end = (int32_t)(b - 1);
+   }
+   refid = find_ref(rnames, region, name_len);
+   if (refid < 0)
+      die("reference %.*s not found", (int)name_len, region);
+   return refid;
+}
+
+/* The first row at or after (refid, pos) in a sorted file, where unplaced records sort last. */
+static uint64_t first_row_at_or_after(const RntFile *f, uint64_t total, int32_t refid, int32_t pos)
+{
+   RntCursor rc;
+   RntCursor pc;
+   rnt_cursor(&rc, f, rnt_column(f, "record.refid", 0));
+   rnt_cursor(&pc, f, rnt_column(f, "record.pos", 0));
+   uint64_t lo = 0;
+   uint64_t hi = total;
+   while (lo < hi) {
+      const uint64_t mid = lo + (hi - lo) / 2;
+      rnt_seek(&rc, mid);
+      const int64_t r = rnt_int(&rc);
+      int before = r >= 0 && r < refid;
+      if (r == refid) {
+         rnt_seek(&pc, mid);
+         before = rnt_int(&pc) < pos;
+      }
+      if (before)
+         lo = mid + 1;
+      else
+         hi = mid;
+   }
+   rnt_cursor_free(&rc);
+   rnt_cursor_free(&pc);
+   return lo;
+}
+
 /* RAMNTupleRecord::GetRefSpan(): the reference bases the CIGAR covers. */
 static int64_t ref_span(const uint32_t *cigar, size_t n)
 {
@@ -400,16 +498,21 @@ int main(int argc, char **argv)
    int header = 0;
    int usage = argc < 2;
    const char *path = NULL;
+   const char *region = NULL;
    for (int i = 1; i < argc; ++i) {
       if (strcmp(argv[i], "-h") == 0)
          header = 1;
       else if (path == NULL && argv[i][0] != '-')
          path = argv[i];
+      else if (region == NULL && argv[i][0] != '-')
+         region = argv[i];
       else
          usage = 1;
    }
    if (usage || path == NULL) {
-      fputs("Usage: ramread [-h] <file.ram>\n", stderr);
+      fputs("Usage: ramread [-h] <file.ram> [region]\n"
+            "Region is rname[:start[-end]], 1-based and inclusive, as in samtools.\n",
+            stderr);
       return 2;
    }
 
@@ -426,6 +529,12 @@ int main(int argc, char **argv)
    Strings orders = meta_strings(meta, "tag_orders");
    Strings rg = meta_strings(meta, "tag_rg");
    Strings pg = meta_strings(meta, "tag_pg");
+   rnt_cursor(&c, meta, rnt_column(meta, "max_ref_span", 0));
+   const int32_t max_span = wrap(rnt_int(&c));
+   rnt_cursor_free(&c);
+   rnt_cursor(&c, meta, rnt_column(meta, "coordinate_sorted", 0));
+   const int sorted = rnt_int(&c) != 0;
+   rnt_cursor_free(&c);
    RntCursor ends_n;
    rnt_cursor(&ends_n, meta, rnt_column(meta, "block_ends", 0));
    rnt_cursor(&c, meta, rnt_column(meta, "block_ends._0", 0));
@@ -448,6 +557,24 @@ int main(int argc, char **argv)
    if (entries > 0 && (nblocks == 0 || ends[nblocks - 1] != entries - 1))
       die("records after the last block");
 
+   /* No region, or "*", means every record. In a sorted file the scan starts a read's longest span before
+      the region; otherwise it reads every record. */
+   const int query = region != NULL && region[0] != '\0' && strcmp(region, "*") != 0;
+   int32_t qref = -1;
+   int32_t qstart = 0;
+   int32_t qend = 0;
+   uint64_t first = 0;
+   if (query) {
+      qref = parse_region(region, &rnames, &qstart, &qend);
+      if (sorted)
+         first = first_row_at_or_after(f, entries, qref, max_span > 0 && qstart > max_span ? qstart - max_span : 0);
+   }
+   /* The names and qualities come a block at a time, so decoding starts at the block that holds the first row. */
+   uint64_t block = 0;
+   while (block < nblocks && ends[block] < first)
+      block++;
+   const uint64_t block_start = block == 0 ? 0 : ends[block - 1] + 1;
+
    Records r;
    records_open(&r, f);
    Block names = {0};
@@ -457,6 +584,14 @@ int main(int argc, char **argv)
    rnt_cursor(&quals.blob_n, f, rnt_column(f, "qualblock", 0));
    rnt_cursor(&quals.blob, f, rnt_column(f, "qualblock._0", 0));
    rnt_cursor(&quals.flags, f, rnt_column(f, "record.compression_flags", 0));
+   if (block_start > 0 && block_start < entries) {
+      records_seek(&r, block_start);
+      rnt_seek(&names.blob_n, block_start);
+      rnt_seek_items(&names.blob, &names.blob_n);
+      rnt_seek(&quals.blob_n, block_start);
+      rnt_seek_items(&quals.blob, &quals.blob_n);
+      rnt_seek(&quals.flags, block_start);
+   }
 
    Str line = {0};
    if (header) {
@@ -472,9 +607,9 @@ int main(int argc, char **argv)
    Str tag_str[4] = {{0}};
    uint32_t *cigar = NULL;
    size_t cigar_cap = 0;
-   uint64_t block = 0;
-   for (uint64_t row = 0; row < entries; ++row) {
-      if (row == 0 || row == ends[block - 1] + 1) {
+   int stopped = 0;
+   for (uint64_t row = block_start; row < entries && !stopped; ++row) {
+      if (row == block_start || row == ends[block - 1] + 1) {
          const uint64_t rows = ends[block] - (block == 0 ? 0 : ends[block - 1] + 1) + 1;
          load_names(&names, rows);
          load_quals(&quals, rows);
@@ -508,6 +643,19 @@ int main(int argc, char **argv)
       const int64_t tag_order = rnt_int(&r.tag_order);
       const uint64_t ntags = rnt_len(&r.tags_n);
       const uint32_t flags = (uint32_t)rnt_int(&r.flags);
+
+      /* Whether ramntuplescan() keeps the row. The rest of the row is decoded either way: the cursors and the
+         blocks move one row at a time. */
+      int keep = 1;
+      if (query) {
+         /* A record with no reference span still covers the base it sits on, as htslib's bam_endpos says. */
+         const int64_t span = ref_span(cigar, (size_t)ncigar);
+         keep = refid == qref && pos <= qend && (pos >= qstart || pos + (span > 0 ? span : 1) - 1 >= qstart);
+         if (sorted && row >= first && (refid < 0 || refid > qref || (refid == qref && pos > qend)))
+            stopped = 1;
+         keep = keep && row >= first && !stopped;
+      }
+      const size_t line_start = line.n;
 
       /* QNAME, from the block. */
       const char *name = names.data + names.at;
@@ -603,6 +751,8 @@ int main(int argc, char **argv)
          put(&line, text.s, text.n);
       }
       put_char(&line, '\n');
+      if (!keep)
+         line.n = line_start;
       if (line.n >= (1U << 20)) {
          fwrite(line.s, 1, line.n, stdout);
          line.n = 0;
@@ -612,7 +762,7 @@ int main(int argc, char **argv)
       fwrite(line.s, 1, line.n, stdout);
    if (fflush(stdout) != 0)
       die("cannot write the output");
-   if (names.at != names.ndata || quals.next != quals.nlengths)
+   if (!stopped && (names.at != names.ndata || quals.next != quals.nlengths))
       die("the last block has more names or qualities than records");
 
    free(line.s);

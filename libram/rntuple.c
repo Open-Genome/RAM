@@ -129,6 +129,8 @@ struct RntColumn {
    uint32_t field;
    Page *pages;
    size_t npages;
+   uint64_t *cluster_first; /* index in the column of each cluster's first element */
+   uint32_t nclusters;
 };
 
 struct RntFile {
@@ -371,6 +373,8 @@ static void page_list(RntFile *f, Buf *p, uint64_t header_ck, uint32_t first_clu
          die("a cluster has %u columns, the schema %u", ncols, f->ncolumns);
       for (uint32_t i = 0; i < ncols; ++i) {
          RntColumn *col = &f->columns[i];
+         if (col->nclusters != first_cluster + k)
+            die("page lists out of order");
          uint32_t npages = 0;
          const size_t pages_end = frame(p, 1, &npages);
          if (npages > p->n)
@@ -393,6 +397,8 @@ static void page_list(RntFile *f, Buf *p, uint64_t header_ck, uint32_t first_clu
          const int64_t offset = (int64_t)le(p, 8);
          if (offset < 0)
             die("suppressed columns are not supported");
+         col->cluster_first = xrealloc(col->cluster_first, (col->nclusters + 1) * sizeof *col->cluster_first);
+         col->cluster_first[col->nclusters++] = (uint64_t)offset;
          for (uint32_t pg = 0; pg < npages; ++pg)
             first[pg].first += (uint64_t)offset;
          p->off = pages_end;
@@ -480,8 +486,10 @@ void rnt_close(RntFile *f)
 {
    for (uint32_t i = 0; i < f->nfields; ++i)
       free(f->names[i]);
-   for (uint32_t i = 0; i < f->ncolumns; ++i)
+   for (uint32_t i = 0; i < f->ncolumns; ++i) {
       free(f->columns[i].pages);
+      free(f->columns[i].cluster_first);
+   }
    free(f->names);
    free(f->parents);
    free(f->columns);
@@ -519,35 +527,37 @@ const RntColumn *rnt_column(const RntFile *f, const char *path, unsigned which)
    die("field %s has no such column", path);
 }
 
-/* How the column type stores an element: its size, and whether it is split, zigzag, delta, signed or an index. */
+/* How the column type stores an element: its size in memory, and whether it is split, zigzag, delta, signed,
+   an index or a bit. */
 typedef struct {
    size_t size;
-   int split, zigzag, delta, is_signed, index;
+   int split, zigzag, delta, is_signed, index, bit;
 } Encoding;
 
 static Encoding encoding(uint16_t type)
 {
    switch (type) {
+   case 0x00: return (Encoding){1, 0, 0, 0, 0, 0, 1};
    case 0x01:
    case 0x02:
-   case 0x04: return (Encoding){1, 0, 0, 0, 0, 0};
-   case 0x03: return (Encoding){1, 0, 0, 0, 1, 0};
-   case 0x05: return (Encoding){2, 0, 0, 0, 1, 0};
-   case 0x06: return (Encoding){2, 0, 0, 0, 0, 0};
-   case 0x07: return (Encoding){4, 0, 0, 0, 1, 0};
-   case 0x08: return (Encoding){4, 0, 0, 0, 0, 0};
-   case 0x09: return (Encoding){8, 0, 0, 0, 1, 0};
-   case 0x0A: return (Encoding){8, 0, 0, 0, 0, 0};
-   case 0x0E: return (Encoding){4, 0, 0, 0, 0, 1};
-   case 0x0F: return (Encoding){8, 0, 0, 0, 0, 1};
-   case 0x11: return (Encoding){2, 1, 1, 0, 1, 0};
-   case 0x12: return (Encoding){2, 1, 0, 0, 0, 0};
-   case 0x13: return (Encoding){4, 1, 1, 0, 1, 0};
-   case 0x14: return (Encoding){4, 1, 0, 0, 0, 0};
-   case 0x15: return (Encoding){8, 1, 1, 0, 1, 0};
-   case 0x16: return (Encoding){8, 1, 0, 0, 0, 0};
-   case 0x1A: return (Encoding){4, 1, 0, 1, 0, 1};
-   case 0x1B: return (Encoding){8, 1, 0, 1, 0, 1};
+   case 0x04: return (Encoding){1, 0, 0, 0, 0, 0, 0};
+   case 0x03: return (Encoding){1, 0, 0, 0, 1, 0, 0};
+   case 0x05: return (Encoding){2, 0, 0, 0, 1, 0, 0};
+   case 0x06: return (Encoding){2, 0, 0, 0, 0, 0, 0};
+   case 0x07: return (Encoding){4, 0, 0, 0, 1, 0, 0};
+   case 0x08: return (Encoding){4, 0, 0, 0, 0, 0, 0};
+   case 0x09: return (Encoding){8, 0, 0, 0, 1, 0, 0};
+   case 0x0A: return (Encoding){8, 0, 0, 0, 0, 0, 0};
+   case 0x0E: return (Encoding){4, 0, 0, 0, 0, 1, 0};
+   case 0x0F: return (Encoding){8, 0, 0, 0, 0, 1, 0};
+   case 0x11: return (Encoding){2, 1, 1, 0, 1, 0, 0};
+   case 0x12: return (Encoding){2, 1, 0, 0, 0, 0, 0};
+   case 0x13: return (Encoding){4, 1, 1, 0, 1, 0, 0};
+   case 0x14: return (Encoding){4, 1, 0, 0, 0, 0, 0};
+   case 0x15: return (Encoding){8, 1, 1, 0, 1, 0, 0};
+   case 0x16: return (Encoding){8, 1, 0, 0, 0, 0, 0};
+   case 0x1A: return (Encoding){4, 1, 0, 1, 0, 1, 0};
+   case 0x1B: return (Encoding){8, 1, 0, 1, 0, 1, 0};
    default: die("column type 0x%02x is not supported", type);
    }
 }
@@ -589,9 +599,18 @@ static void load(RntCursor *c)
    uint8_t *raw = read_at(c->file, pg->offset, pg->size + (pg->checksum ? 8 : 0));
    if (pg->checksum && XXH3_64bits(raw, (size_t)pg->size) != le64_at(raw + pg->size))
       die("page checksum mismatch at %" PRIu64, pg->offset);
-   uint8_t *page = unzip(raw, (size_t)pg->size, n * e.size);
+   uint8_t *page = unzip(raw, (size_t)pg->size, e.bit ? (n + 7) / 8 : n * e.size);
    c->n = n;
    c->at = 0;
+   if (e.bit) {
+      /* Eight to a byte, the first in the lowest bit. */
+      free(c->bytes);
+      c->bytes = xrealloc(NULL, n);
+      for (size_t i = 0; i < n; ++i)
+         c->bytes[i] = (uint8_t)(page[i / 8] >> (i % 8) & 1);
+      free(page);
+      return;
+   }
    if (e.size == 1) {
       free(c->bytes);
       c->bytes = page;
@@ -613,6 +632,56 @@ static void load(RntCursor *c)
       c->ints[i] = v;
    }
    free(page);
+}
+
+void rnt_seek(RntCursor *c, uint64_t element)
+{
+   const RntColumn *col = c->col;
+   /* The first page that ends after the element. */
+   size_t lo = 0;
+   size_t hi = col->npages;
+   while (lo < hi) {
+      const size_t mid = lo + (hi - lo) / 2;
+      if (col->pages[mid].first + col->pages[mid].nelem <= element)
+         lo = mid + 1;
+      else
+         hi = mid;
+   }
+   c->page = lo;
+   c->n = c->at = 0;
+   c->prev = 0;
+   if (lo == col->npages) { /* the end of the column: reading from here fails */
+      c->consumed = element;
+      c->cluster = UINT32_MAX;
+      return;
+   }
+   const Page *pg = &col->pages[lo];
+   if (element < pg->first)
+      die("the pages of a column do not follow each other");
+   c->consumed = pg->first;
+   c->cluster = pg->cluster;
+   load(c);
+   c->at = (size_t)(element - pg->first);
+   if (!encoding(col->type).index)
+      return;
+   /* Offsets count from the start of the cluster: the one before the element, if in the same cluster. */
+   if (c->at > 0)
+      c->prev = c->ints[c->at - 1];
+   else if (lo > 0 && col->pages[lo - 1].cluster == pg->cluster) {
+      rnt_seek(c, element - 1);
+      c->prev = c->ints[c->at++];
+   }
+}
+
+void rnt_seek_items(RntCursor *items, const RntCursor *index)
+{
+   if (index->cluster == UINT32_MAX) {
+      rnt_seek(items, UINT64_MAX);
+      return;
+   }
+   if (index->page == 0 || index->cluster >= items->col->nclusters)
+      die("seek in a collection before its index");
+   rnt_seek(items, items->col->cluster_first[index->cluster] + (uint64_t)index->prev);
 }
 
 static void next(RntCursor *c)
