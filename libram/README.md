@@ -1,18 +1,24 @@
 # libram (proof of concept)
 
-Can a RAM file be read without ROOT? `ramread` answers for the container:
-it is about 550 lines of C11 that need only zstd and the xxHash header, and
-print one integer field of a RAM file.
+Can a RAM file be read without ROOT? `ramread` writes a RAM file out as SAM,
+the same bytes as `ramdump`, with only zstd, the xxHash header and htscodecs,
+which htslib already ships. It is C11, for htslib.
 
-It follows the RNTuple binary format specification 1.0: it finds the
-`ROOT::RNTuple` anchor of `RAM` in the ROOT file's top directory, reads the
-header, footer and page list envelopes, and decodes the pages of the field.
-Every envelope, page and the anchor is checked against its XXH3 checksum, and
-every read is bounds-checked, since the file is untrusted.
+- `rntuple.c`, `rntuple.h`: reads the columns of an RNTuple in a ROOT file,
+  following the RNTuple binary format specification 1.0. It finds the anchor in
+  the ROOT file's top directory, checks the anchor, every envelope and every
+  page against its XXH3 checksum, bounds-checks every read, and decodes the
+  integer, index, character and byte columns a page at a time.
+- `ramread.c`: RAM on top of it: METADATA, the record columns, the tag orders,
+  the blocks of names (tok3) and qualities (rANS or fqzcomp), and the PNEXT
+  and TLEN predictions. It follows ramtools' RAMNTupleRecord, RAMTags and
+  RecordBlocks, so a change to the format needs the same change here.
 
-    make                       # CPPFLAGS=-I<dir> if xxhash.h is elsewhere
-    ./ramread file.ram record.pos
+Build, with htscodecs from pkg-config or from its source:
 
-It reads the integer fields of the record (`pos`, `flag`, `mapq`, `refid`,
-`tag_nm`, ...) of files written with ZSTD, the default. Strings, vectors,
-the name and quality blocks, METADATA and writing are not done yet.
+    make HTSCODECS=<htscodecs source>   # CPPFLAGS=-I<dir> if xxhash.h is elsewhere
+    ./ramread -h file.ram > file.sam
+
+Not done yet: region queries, files compressed with anything but ZSTD (the
+default), and writing. A damaged file ends the program with a message rather
+than returning an error to a caller.

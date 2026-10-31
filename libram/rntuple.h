@@ -1,0 +1,48 @@
+/* rntuple: read the columns of an RNTuple in a ROOT file without ROOT.
+
+   Follows the RNTuple binary format specification 1.0. Every anchor, envelope
+   and page is checked against its XXH3 checksum and every read is bounds
+   checked; a damaged file ends the program with a message on stderr. */
+
+#ifndef LIBRAM_RNTUPLE_H
+#define LIBRAM_RNTUPLE_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+typedef struct RntFile RntFile;
+typedef struct RntColumn RntColumn;
+
+/* Reads one column from its first element to its last, a page at a time. */
+typedef struct {
+   const RntFile *file;
+   const RntColumn *col;
+   size_t page; /* the next page to load */
+   uint8_t *bytes;
+   int64_t *ints; /* the page's elements, decoded, for columns wider than a byte */
+   size_t n, at;  /* elements in the loaded page, and the next one */
+   uint32_t cluster;
+   int64_t prev;      /* index columns: the offset before the next one, in its cluster */
+   uint64_t consumed; /* elements read before the loaded page */
+} RntCursor;
+
+_Noreturn void rnt_die(const char *fmt, ...);
+
+/* The RNTuple called name in the ROOT file at path. */
+RntFile *rnt_open(const char *path, const char *name);
+void rnt_close(RntFile *f);
+uint64_t rnt_entries(const RntFile *f);
+
+/* The which-th column (0 the principal one) of the field at a dotted path such as "record.seq". */
+const RntColumn *rnt_column(const RntFile *f, const char *path, unsigned which);
+
+void rnt_cursor(RntCursor *c, const RntFile *f, const RntColumn *col);
+void rnt_cursor_free(RntCursor *c);
+/* The next value of an integer column. */
+int64_t rnt_int(RntCursor *c);
+/* The number of items in the next collection, from its index column. */
+uint64_t rnt_len(RntCursor *c);
+/* The next n elements of a column of bytes or characters, into dst (NULL skips them). */
+void rnt_bytes(RntCursor *c, size_t n, uint8_t *dst);
+
+#endif

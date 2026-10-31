@@ -18,6 +18,8 @@ tmp/
 *.rootix
 build/
 libram/ramread
+libram/*.o
+libram/codecs/
 cmake-build-*/
 Build/
 BUILD/
