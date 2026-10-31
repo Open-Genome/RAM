@@ -593,7 +593,6 @@ bool samtoramntuple(const char *datafile, const char *treefile, int compression_
 
    ROOT::RNTupleWriteOptions writeOptions;
    writeOptions.SetCompression(compression_algorithm);
-   writeOptions.SetMaxUnzippedPageSize(64000);
    // Required by RNTupleParallelWriter.
    writeOptions.SetUseBufferedWrite(true);
 
