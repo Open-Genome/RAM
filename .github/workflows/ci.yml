@@ -53,6 +53,8 @@ jobs:
     name: Code Coverage
     runs-on: ubuntu-24.04
     needs: build-and-test # Run only if build-and-test succeeds
+    env:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
     
     steps:
     - uses: actions/checkout@v5
@@ -102,11 +104,13 @@ jobs:
           --exclude '../benchmark/' \
           --print-summary
         
+    # Codecov refuses uploads without a token, which forks do not have.
     - name: Upload coverage to Codecov
+      if: env.CODECOV_TOKEN != ''
       uses: codecov/codecov-action@v5
       with:
         files: ./build/coverage.xml
         flags: unittests
         name: codecov-ramtools
         fail_ci_if_error: true
-        token: ${{ secrets.CODECOV_TOKEN }}
+        token: ${{ env.CODECOV_TOKEN }}
