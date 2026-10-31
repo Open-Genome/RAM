@@ -253,6 +253,7 @@ chr20 of NA12878 on your own machine.
 | CRAM 3.1 with the reference | 67.9 MB | 70.1 MB |
 | CRAM 3.1, `embed_ref=2` | 69.1 MB | 41.9 MB |
 | RAM | 79.9 MB | 46.5 MB |
+| RAM, `-compression 509` | 73.4 MB | 43.0 MB |
 
 RAM gives both inputs back byte for byte (`ramdump -h` against
 `samtools view -h`). Both CRAMs give the Illumina reads back exactly, but the
@@ -310,7 +311,10 @@ whole page of every column and a whole block of names and qualities, up to
 1 is ZLIB, 2 LZMA, 4 LZ4, 5 ZSTD, with levels 1 to 9, and 0 means no
 compression. The default is 505, ZSTD level 5. For a quick conversion use 501
 or 503 with `-threads`; for the smallest file, 509 at a much higher conversion
-cost.
+cost. On the two slices above, 509 makes the files 8% smaller and takes about
+five times as long to convert (97 s against 22 s for the Illumina slice, 40 s
+against 7 s for Revio, `-threads 4`). Reading is no slower: a full `ramdump`
+takes 3.9 s against 4.5 s and 1.1 s against 1.2 s.
 
 Read names and lossless quality scores are stored in blocks of 10,000
 records or 5 million quality values, whichever comes first, as CRAM sizes its
