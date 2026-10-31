@@ -4,7 +4,7 @@
 
 RAM (ROOT Alignment/Map) is a file format for aligned sequencing reads, the same
 data as a BAM, stored column by column in ROOT's RNTuple format. A RAM file is
-about a quarter smaller than the BAM of the same reads, needs no reference to be
+about half the size of the BAM of the same reads, needs no reference to be
 read, and answers region queries such as `chr13:32889611-32973805`. RAMTools
 converts SAM and BAM files to RAM, queries them, and writes them back out as SAM
 so every result can be checked against samtools.
@@ -227,67 +227,82 @@ The two counts agree, the `diff`s print nothing, and for a SAM input
 
 ## Benchmarks
 
-The numbers in this section predate the current file format.
-[bench/README.md](bench/README.md) measures the current code on your
-own machine: it downloads chr20 of NA12878, builds two revisions, measures
-them against each other and against samtools, and writes a report.
+Two 5 Mb slices of chr20 (30,000,000 to 35,000,000 on GRCh38), one of short
+reads and one of long reads:
 
-HG00154 from the 1000 Genomes Project: 196,040,370 records, 72.06 GB as SAM,
-coordinate sorted, GRCh37 reference names (`1`, not `chr1`). Run on an Intel
-i3-7020U laptop (2 cores, 4 threads, 12 GB of memory) with input and output on
-the same hard disk, samtools 1.13. Every output holds the same 196,040,370
-records.
+| | Illumina | PacBio Revio |
+|---|---|---|
+| Sample | HG00154 from the 1000 Genomes 30x set (NYGC): NovaSeq, qualities binned to four values, Illumina read names | HG002 from PacBio's public Revio release, `HG002.m84011_220902_175841_s1.GRCh38.bam`: HiFi reads of about 15 kb |
+| Records | 1,815,389 | 14,630 |
+| Bases | 272 million | 228 million |
+
+RAM is `bamtoramntuple -threads 4` with the default ZSTD 5. CRAM is CRAM 3.1
+with samtools' default profile, once against the reference
+(`samtools view -O cram,version=3.1 -T chr20.fa`) and once with
+`-O cram,version=3.1,embed_ref=2`, which stores a consensus of each slice's
+reads instead, so that like RAM it reads without a reference. Run with
+samtools 1.22 and ROOT 6.38 on an Intel i3-7020U laptop (2 cores, 4 threads).
+[bench/README.md](bench/README.md) measures conversion, size and queries on
+chr20 of NA12878 on your own machine.
 
 ### File size
 
-![File size of HG00154 in each format](assets/benchmark_sizes.svg)
+| | Illumina | Revio |
+|---|---:|---:|
+| BAM | 152.4 MB | 101.2 MB |
+| CRAM 3.1 with the reference | 67.9 MB | 70.1 MB |
+| CRAM 3.1, `embed_ref=2` | 69.1 MB | 41.9 MB |
+| RAM | 79.9 MB | 46.5 MB |
 
-BAM is `samtools view -b`, CRAM is `samtools view -C -T ref.fasta`, and each RAM
-file is `samtoramntuple -compression N` with the setting shown. A CRAM cannot
-be read without its reference, so the stacked bar is the size of a
-self-contained copy. Uncompressed RAM (`-compression 0`) is 83.7 GB, larger
-than the SAM, because every string and vector column carries an offset column
-that the codecs then remove. ZSTD 9 is the only setting that comes in under
-CRAM plus its reference, at ten times the conversion time of ZSTD 5 for 9% less
-space.
+RAM gives both inputs back byte for byte (`ramdump -h` against
+`samtools view -h`). Both CRAMs give the Illumina reads back exactly, but the
+Revio reads with `M` in place of their `=` and `X` CIGAR operations and with
+RG moved among the tags. Converted from the records as the CRAM returns them,
+the Revio RAM file is 42.6 MB.
 
-### Conversion
+### By field
 
-From the SAM file. CPU is user plus system time; wall time is bounded by the
-hard disk, which reads and writes about 77 MB/s.
+`ramstats size` for RAM and `samtools cram-size` for the `embed_ref=2` CRAM,
+in MB on disk. CRAM keeps the CIGAR in its sequence features, so its SEQ row
+holds both.
 
-| Output | Command | Wall | CPU (s) | Size (GB) |
-|--------|---------|------|---------|-----------|
-| BAM | `samtools view -@ 4 -b` | 24:08 | 3,589 | 15.22 |
-| CRAM | `samtools view -@ 4 -C -T ref.fasta` | 12:34 | 1,817 | 7.77 |
-| RAM, ZSTD 5 | `samtoramntuple` | 1:30:06 | 5,258 | 11.43 |
-| RAM, ZSTD 5 | `samtoramntuple -threads 4` | 32:59 | 7,664 | 11.43 |
-| RAM, ZSTD 3 | `samtoramntuple -compression 503 -threads 4` | 17:09 | 3,513 | 11.74 |
-| RAM, ZSTD 1 | `samtoramntuple -compression 501 -threads 4` | 14:32 | 1,273 | 12.27 |
+| | Illumina RAM | Illumina CRAM | Revio RAM | Revio CRAM |
+|---|---:|---:|---:|---:|
+| SEQ | 13.96 | 10.90 | 8.99 | 10.60 |
+| CIGAR | 2.15 | | 5.66 | |
+| QUAL | 11.05 | 11.07 | 24.54 | 24.51 |
+| NAME | 7.38 | 7.38 | 0.05 | 0.06 |
+| AUX (tags) | 39.04 | 33.94 | 7.20 | 6.52 |
+| MATE (RNEXT, PNEXT, TLEN) | 3.87 | 2.78 | 0.03 | 0.03 |
+| other (FLAG, POS, MAPQ, ...) | 2.31 | 2.71 | 0.03 | 0.06 |
 
-Almost all of the conversion time is ZSTD; parsing the SAM is about 4% of it.
-Lowering the level is what makes it faster: ZSTD 3 needs half the CPU of ZSTD 5
-for a 3% larger file, and ZSTD 1 converts faster than samtools writes a BAM and
-still gives a file a fifth smaller.
+Names and qualities are compressed with the codecs CRAM 3.1 uses, tok3 and
+rANS order 1, in blocks the size of a CRAM slice, and come out the same size.
+On the Illumina reads 5.2 MB of the tags are MD and NM, which a CRAM does not
+store but computes again from its reference or consensus; a RAM file has
+neither and stores them. CRAM also stores the bases as differences from that
+consensus, where RAM compresses them as text with ZSTD in pages of up to 1 MiB.
+On the Revio reads most of the CIGAR is the `=` and `X` detail the CRAMs drop.
 
 ### Region queries
 
-Records overlapping a region, counted with `samtools view -c` for BAM and CRAM
-and `ramdump -c` for RAM (ZSTD 5). Best of three runs, warm cache. All three
-formats return the same records for every region.
+Records overlapping a region, counted (`samtools view -c`, `ramdump -c`) and
+printed as SAM to `/dev/null`. CRAM is the `embed_ref=2` file. Best of five
+runs, warm cache, in seconds; all three formats return the same records.
 
-| Region | Records | BAM (s) | CRAM (s) | RAM (s) |
-|--------|---------|---------|----------|---------|
-| 100 bp, `1:1000000-1000100` | 2 | 0.15 | 0.10 | 0.48 |
-| BRCA2, `13:32889611-32973805` | 6,057 | 0.10 | 0.09 | 0.39 |
-| 10 Mb, `1:10000000-20000000` | 582,985 | 0.80 | 1.75 | 0.40 |
-| 100 Mb, `2:1-100000000` | 7,048,385 | 8.59 | 21.43 | 0.85 |
+| Region | Records | Count BAM | Count CRAM | Count RAM | Print BAM | Print CRAM | Print RAM |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Illumina, 100 bp | 68 | 0.016 | 0.027 | 0.054 | 0.016 | 0.040 | 0.136 |
+| Illumina, 85 kb | 23,408 | 0.030 | 0.041 | 0.055 | 0.044 | 0.098 | 0.188 |
+| Illumina, 1 Mb | 726,726 | 0.840 | 0.698 | 0.113 | 1.700 | 3.050 | 1.837 |
+| Revio, 100 bp | 20 | 0.012 | 0.017 | 0.044 | 0.012 | 0.042 | 0.124 |
+| Revio, 85 kb | 180 | 0.022 | 0.022 | 0.044 | 0.024 | 0.070 | 0.132 |
+| Revio, 1 Mb | 6,018 | 0.447 | 0.526 | 0.043 | 0.614 | 1.254 | 0.668 |
 
-A RAM query spends about 0.4 s starting ROOT and opening the file, then finds
-the region by binary search and counts about 15 million records per second,
-since a count reads only the position and CIGAR columns. It is slower than
-samtools on small regions and faster from about 10 Mb up. The codec makes
-little difference: the 10 Mb query takes 0.46 to 0.55 s across all of them.
+A RAM count reads only the position and CIGAR columns, so it stays fast as the
+region grows. Printing a small region is slower than samtools: RAM decodes a
+whole page of every column and a whole block of names and qualities, up to
+10,000 records or 5 million quality values, about as much as a CRAM slice.
 
 ### Compression settings
 
@@ -298,7 +313,8 @@ or 503 with `-threads`; for the smallest file, 509 at a much higher conversion
 cost.
 
 Read names and lossless quality scores are stored in blocks of 10,000
-records, the size of a CRAM slice, with the codecs CRAM 3.1 uses by default:
+records or 5 million quality values, whichever comes first, as CRAM sizes its
+slices, with the codecs CRAM 3.1 uses by default:
 the names with tok3, the qualities with rANS order 1. `-fqzcomp` compresses the
 quality blocks with fqzcomp instead, CRAM 3.1's codec for its smaller
 profiles. On chr20 of NA12878 at 30x, whose qualities are binned to four
