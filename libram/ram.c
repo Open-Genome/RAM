@@ -1,6 +1,6 @@
 /* ram: read a RAM file without ROOT, a record at a time, as htslib's bam1_t.
 
-   The record layout, the tag orders, the blocks of names and qualities and the
+   The record layout, the tag orders, the blocks of names, qualities and consensus, and the
    PNEXT and TLEN predictions follow ramtools' RAMNTupleRecord, RAMTags and
    RecordBlocks; a change to those needs the same change here.
 
@@ -26,14 +26,15 @@
 #include <string.h>
 
 enum {
-   kFormatVersion = 8
+   kFormatVersion = 9
 };
 
 /* RAMNTupleRecord's compression_flags bits. */
 enum {
    kIlluminaBinning = 1 << 15,
    kDrop = 1 << 16,
-   kQualInBlock = 1 << 18
+   kQualInBlock = 1 << 18,
+   kSeqConsensus = 1 << 20
 };
 
 /* The first byte of a quality block: rANS or fqzcomp. */
@@ -67,7 +68,8 @@ typedef struct {
 
 typedef struct {
    RntCursor flag, refid, pos, mapq, cigar_n, cigar, refnext, pnext_delta, tlen_delta;
-   StrField seq, qual;
+   StrField seq_lit, qual;
+   RntCursor seq_diff_n, seq_diff;
    RntCursor tag_int[4], tag_rg, tag_pg;
    StrField tag_str[4];
    RntCursor tag_order, tags_n, flags;
@@ -100,15 +102,18 @@ struct RamFile {
    int32_t max_span;
    int sorted;
    Records r;
-   Block names, quals;
+   Block names, quals, cons; /* cons: the consensus, whose first base cons_pos gives */
+   RntCursor cons_pos;
+   int64_t cons_start;
+   size_t cons_len;
    /* What ram_query asked for, and where reading is. */
    int query, stopped;
    int32_t qref, qstart, qend;
    uint64_t first, block_start, block, row;
    /* The record being read. */
-   Str seq, qual, text, tag_str[4];
-   uint32_t *cigar;
-   size_t cigar_cap;
+   Str seq, seq_lit, qual, text, tag_str[4];
+   uint32_t *cigar, *diffs;
+   size_t cigar_cap, diffs_cap;
    uint8_t *array, *varints;
    int64_t *values;
 };
@@ -263,7 +268,9 @@ static void records_open(Records *r, RntFile *f)
    rnt_cursor(&r->refnext, f, rnt_column(f, "record.refnext", 0));
    rnt_cursor(&r->pnext_delta, f, rnt_column(f, "record.pnext_delta", 0));
    rnt_cursor(&r->tlen_delta, f, rnt_column(f, "record.tlen_delta", 0));
-   str_field(&r->seq, f, "record.seq");
+   str_field(&r->seq_lit, f, "record.seq_lit");
+   rnt_cursor(&r->seq_diff_n, f, rnt_column(f, "record.seq_diff", 0));
+   rnt_cursor(&r->seq_diff, f, rnt_column(f, "record.seq_diff._0", 0));
    str_field(&r->qual, f, "record.qual");
    for (int i = 0; i < 4; ++i) {
       rnt_cursor(&r->tag_int[i], f, rnt_column(f, ints[i], 0));
@@ -286,7 +293,9 @@ static void records_seek(Records *r, uint64_t row)
       rnt_seek(cursors[i], row);
    rnt_seek(&r->cigar_n, row);
    rnt_seek_items(&r->cigar, &r->cigar_n);
-   StrField *strs[] = {&r->seq, &r->qual, &r->tag_str[0], &r->tag_str[1], &r->tag_str[2], &r->tag_str[3]};
+   rnt_seek(&r->seq_diff_n, row);
+   rnt_seek_items(&r->seq_diff, &r->seq_diff_n);
+   StrField *strs[] = {&r->seq_lit, &r->qual, &r->tag_str[0], &r->tag_str[1], &r->tag_str[2], &r->tag_str[3]};
    for (size_t i = 0; i < sizeof strs / sizeof *strs; ++i)
       str_seek(strs[i], row);
    rnt_seek(&r->tags_n, row);
@@ -299,10 +308,10 @@ static void records_free(Records *r)
    RntCursor *cursors[] = {&r->flag,       &r->refid,      &r->pos,         &r->mapq,       &r->cigar_n,
                            &r->cigar,      &r->refnext,    &r->pnext_delta, &r->tlen_delta, &r->tag_int[0],
                            &r->tag_int[1], &r->tag_int[2], &r->tag_int[3],  &r->tag_rg,     &r->tag_pg,
-                           &r->tag_order,  &r->tags_n,     &r->flags};
+                           &r->tag_order,  &r->tags_n,     &r->flags,       &r->seq_diff_n, &r->seq_diff};
    for (size_t i = 0; i < sizeof cursors / sizeof *cursors; ++i)
       rnt_cursor_free(cursors[i]);
-   StrField *strs[] = {&r->seq, &r->qual, &r->tag_str[0], &r->tag_str[1], &r->tag_str[2], &r->tag_str[3], &r->tags};
+   StrField *strs[] = {&r->seq_lit, &r->qual, &r->tag_str[0], &r->tag_str[1], &r->tag_str[2], &r->tag_str[3], &r->tags};
    for (size_t i = 0; i < sizeof strs / sizeof *strs; ++i)
       str_free(strs[i]);
 }
@@ -427,6 +436,71 @@ static void load_quals(RamFile *rf, uint64_t rows)
    } else {
       die(rf, "a quality block has an unknown codec");
    }
+}
+
+/* SeqBlockReader: the block's consensus and the position of its first base. */
+static void load_consensus(RamFile *rf, uint64_t rows)
+{
+   rf->cons_len = read_blob(rf, &rf->cons, rows);
+   for (uint64_t i = 0; i < rows; ++i)
+      rf->cons_start = rnt_int(&rf->cons_pos);
+   check(rf, rf->f);
+}
+
+/* Rebuilds into rf->seq the SEQ that a record with kSeqConsensus codes against its block's consensus, as
+   RecordBlocks' DecodeSeq() does. */
+static void decode_seq(RamFile *rf, const char *name, int32_t pos, size_t ncigar, size_t ndiffs)
+{
+   static const char kAcgt[] = "ACGT";
+   static const char kBases[] = "=ACMGRSVTWYHKDBN";
+   /* Each difference is its step from the previous one, shifted left 5 bits, ORed with its code. */
+   enum {
+      kSubOther = 3,
+      kDiffCodeBits = 5
+   };
+   Str *s = &rf->seq;
+   const Str *lit = &rf->seq_lit;
+   const uint8_t *cons = rf->cons.bytes;
+   int64_t at = (int64_t)pos - rf->cons_start;
+   size_t used = 0;
+   s->n = 0;
+   for (size_t i = 0; i < ncigar; ++i) {
+      const int type = bam_cigar_type(bam_cigar_op(rf->cigar[i]));
+      const size_t n = bam_cigar_oplen(rf->cigar[i]);
+      if (type == 3) {
+         if (at < 0 || (uint64_t)at > rf->cons_len || n > rf->cons_len - (size_t)at)
+            die(rf, "the SEQ of record %s is damaged", name);
+         put(rf, s, cons + at, n);
+      } else if (type & 1) {
+         if (n > lit->n - used)
+            die(rf, "the SEQ of record %s is damaged", name);
+         put(rf, s, lit->s + used, n);
+         used += n;
+      }
+      if (type & 2)
+         at += (int64_t)n;
+   }
+   if (used != lit->n)
+      die(rf, "the SEQ of record %s is damaged", name);
+   size_t p = 0;
+   for (size_t k = 0; k < ndiffs; ++k) {
+      p += rf->diffs[k] >> kDiffCodeBits;
+      if (p >= s->n)
+         die(rf, "the SEQ of record %s is damaged", name);
+      const unsigned code = rf->diffs[k] & ((1U << kDiffCodeBits) - 1);
+      if (code < kSubOther) {
+         const char *c = s->s[p] ? strchr(kAcgt, s->s[p]) : NULL;
+         if (c == NULL)
+            die(rf, "the SEQ of record %s is damaged", name);
+         s->s[p] = kAcgt[((size_t)(c - kAcgt) + code + 1) % 4];
+      } else if (code - kSubOther < 16) {
+         s->s[p] = kBases[code - kSubOther];
+      } else {
+         die(rf, "the SEQ of record %s is damaged", name);
+      }
+   }
+   reserve(rf, s, 1);
+   s->s[s->n] = '\0';
 }
 
 static void block_free(Block *b)
@@ -778,6 +852,9 @@ static void open_file(RamFile *rf, const char *path)
    rnt_cursor(&rf->quals.blob_n, rf->f, rnt_column(rf->f, "qualblock", 0));
    rnt_cursor(&rf->quals.blob, rf->f, rnt_column(rf->f, "qualblock._0", 0));
    rnt_cursor(&rf->quals.flags, rf->f, rnt_column(rf->f, "record.compression_flags", 0));
+   rnt_cursor(&rf->cons.blob_n, rf->f, rnt_column(rf->f, "consensus", 0));
+   rnt_cursor(&rf->cons.blob, rf->f, rnt_column(rf->f, "consensus", 1));
+   rnt_cursor(&rf->cons_pos, rf->f, rnt_column(rf->f, "consensus_pos", 0));
    check(rf, rf->f);
    start(rf, 0, -1, 0, 0);
 }
@@ -796,10 +873,14 @@ static int next_record(RamFile *rf, bam1_t *b)
          rnt_seek(&quals->blob_n, row);
          rnt_seek_items(&quals->blob, &quals->blob_n);
          rnt_seek(&quals->flags, row);
+         rnt_seek(&rf->cons.blob_n, row);
+         rnt_seek_items(&rf->cons.blob, &rf->cons.blob_n);
+         rnt_seek(&rf->cons_pos, row);
       }
       if (row == rf->block_start || row == rf->ends[rf->block - 1] + 1) {
          load_names(rf, rf->ends[rf->block] - row + 1);
          load_quals(rf, rf->ends[rf->block] - row + 1);
+         load_consensus(rf, rf->ends[rf->block] - row + 1);
          rf->block++;
       }
       const uint16_t flag = (uint16_t)rnt_int(&r->flag);
@@ -818,7 +899,16 @@ static int next_record(RamFile *rf, bam1_t *b)
       const int64_t refnext = rnt_int(&r->refnext);
       const int32_t pnext_delta = (int32_t)rnt_int(&r->pnext_delta);
       const int32_t tlen_delta = (int32_t)rnt_int(&r->tlen_delta);
-      str_next(rf, &r->seq, &rf->seq);
+      str_next(rf, &r->seq_lit, &rf->seq_lit);
+      const uint64_t ndiffs = rnt_len(&r->seq_diff_n);
+      if (ndiffs > (1U << 30))
+         die(rf, "too many SEQ differences");
+      if (ndiffs > rf->diffs_cap) {
+         rf->diffs_cap = (size_t)ndiffs;
+         rf->diffs = xrealloc(rf, rf->diffs, rf->diffs_cap * sizeof *rf->diffs);
+      }
+      for (size_t i = 0; i < ndiffs; ++i)
+         rf->diffs[i] = (uint32_t)rnt_int(&r->seq_diff);
       str_next(rf, &r->qual, &rf->qual);
       int32_t tag_int[4];
       for (int i = 0; i < 4; ++i)
@@ -875,7 +965,10 @@ static int next_record(RamFile *rf, bam1_t *b)
       const int same_ref = tid >= 0 && mtid == tid;
       const int32_t mpos = same_ref ? wrap((int64_t)pnext_delta + pos) : pnext_delta;
       const int32_t tlen = wrap((int64_t)tlen_delta + predict_tlen(flag, pos, span, mpos, same_ref));
-      const size_t l_seq = rf->seq.n == 1 && rf->seq.s[0] == '*' ? 0 : rf->seq.n;
+      if (flags & kSeqConsensus)
+         decode_seq(rf, name, pos, (size_t)ncigar, (size_t)ndiffs);
+      const Str *seq = flags & kSeqConsensus ? &rf->seq : &rf->seq_lit;
+      const size_t l_seq = seq->n == 1 && seq->s[0] == '*' ? 0 : seq->n;
 
       /* QUAL without its offset: from the block, or from the record as RAMNTupleUtils::DecodeQuality()
          reads it. NULL is "*". */
@@ -898,7 +991,7 @@ static int next_record(RamFile *rf, bam1_t *b)
       if (qual != NULL && qual_len != l_seq)
          die(rf, "record %s has %zu bases and %zu qualities", name, l_seq, qual_len);
       if (bam_set1(b, name_len, name, flag, tid, pos, (uint8_t)mapq, (size_t)ncigar, rf->cigar, mtid, mpos, tlen, l_seq,
-                   rf->seq.s, qual, 0) < 0)
+                   seq->s, qual, 0) < 0)
          die(rf, "record %s does not fit a bam1_t", name);
 
       /* The tags in input order, as RAMTagReader::Append() writes them. */
@@ -981,6 +1074,8 @@ void ram_close(RamFile *rf)
    records_free(&rf->r);
    block_free(&rf->names);
    block_free(&rf->quals);
+   block_free(&rf->cons);
+   rnt_cursor_free(&rf->cons_pos);
    rnt_cursor_free(&rf->mc);
    str_free(&rf->ms);
    if (rf->meta)
@@ -991,13 +1086,15 @@ void ram_close(RamFile *rf)
    Strings *all[] = {&rf->lines, &rf->rnames, &rf->rnexts, &rf->orders, &rf->rg, &rf->pg};
    for (size_t i = 0; i < sizeof all / sizeof *all; ++i)
       strings_free(all[i]);
-   Str *strs[] = {&rf->seq, &rf->qual, &rf->text, &rf->tag_str[0], &rf->tag_str[1], &rf->tag_str[2], &rf->tag_str[3]};
+   Str *strs[] = {&rf->seq,        &rf->seq_lit,    &rf->qual,       &rf->text,
+                  &rf->tag_str[0], &rf->tag_str[1], &rf->tag_str[2], &rf->tag_str[3]};
    for (size_t i = 0; i < sizeof strs / sizeof *strs; ++i)
       free(strs[i]->s);
    free(rf->tids);
    free(rf->mtids);
    free(rf->ends);
    free(rf->cigar);
+   free(rf->diffs);
    free(rf->array);
    free(rf->values);
    free(rf->varints);
