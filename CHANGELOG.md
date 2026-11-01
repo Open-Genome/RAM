@@ -43,6 +43,21 @@ the README for what that means before 1.0.
 
 ### Changed
 
+- SEQ is stored as differences from a consensus of each block of records, as
+  CRAM's `embed_ref=2` slices store it: the block's last row carries the
+  commonest base at every position its aligned reads cover, and each aligned
+  read keeps only its substitutions against it and its soft-clipped and
+  inserted bases. Unmapped reads and reads the consensus does not cover keep
+  SEQ as text. A block also ends at 5 million bases now, not only at 5 million
+  quality values. On 5 Mb of chr20, HG00154 Illumina reads go from 79.9 to
+  75.9 MB and HG002 Revio reads from 46.5 to 44.8 MB. Conversion is 4 to 14%
+  faster from BAM (`-threads 4` codes each block on another thread) and 1 to
+  9% from SAM, at 1 and 4 threads. Printing a 1 Mb region takes 8% (Illumina)
+  and 16% (Revio) longer, and a full dump of the Illumina reads 6%; regions of
+  100 bp and 85 kb print 4 to 7% slower on Illumina and 16 to 17% faster on
+  Revio.
+  The format version becomes 9, and files written before must be converted
+  again.
 - The converters write RNTuple's default pages of up to 1 MiB instead of
   64 KB, so ZSTD sees more than four long reads at a time. On 5 Mb of chr20
   converted from SAM, HG002 PacBio Revio reads go from 64.4 to 46.5 MB (28%
