@@ -448,10 +448,15 @@ static void load_consensus(RamFile *rf, uint64_t rows)
 }
 
 /* Rebuilds into rf->seq the SEQ that a record with kSeqConsensus codes against its block's consensus, as
-   RecordBlocks' DecodeSeq() does. */
+   SeqBlockReader::Decode() does. */
 static void decode_seq(RamFile *rf, const char *name, int32_t pos, size_t ncigar, size_t ndiffs)
 {
-   static const char kAcgt[] = "ACGT";
+   /* The base a code below kSubOther gives in place of each consensus base, '\0' for any other byte. */
+   static const char kSubstitute[3][256] = {
+      {['A'] = 'C', ['C'] = 'G', ['G'] = 'T', ['T'] = 'A'},
+      {['A'] = 'G', ['C'] = 'T', ['G'] = 'A', ['T'] = 'C'},
+      {['A'] = 'T', ['C'] = 'A', ['G'] = 'C', ['T'] = 'G'},
+   };
    static const char kBases[] = "=ACMGRSVTWYHKDBN";
    /* Each difference is its step from the previous one, shifted left 5 bits, ORed with its code. */
    enum {
@@ -464,14 +469,21 @@ static void decode_seq(RamFile *rf, const char *name, int32_t pos, size_t ncigar
    int64_t at = (int64_t)pos - rf->cons_start;
    size_t used = 0;
    s->n = 0;
-   for (size_t i = 0; i < ncigar; ++i) {
+   for (size_t i = 0; i < ncigar;) {
       const int type = bam_cigar_type(bam_cigar_op(rf->cigar[i]));
-      const size_t n = bam_cigar_oplen(rf->cigar[i]);
       if (type == 3) {
+         /* Long reads have hundreds of M, = and X operations in a row: one copy for each run. */
+         size_t n = 0;
+         for (; i < ncigar && bam_cigar_type(bam_cigar_op(rf->cigar[i])) == 3; ++i)
+            n += bam_cigar_oplen(rf->cigar[i]);
          if (at < 0 || (uint64_t)at > rf->cons_len || n > rf->cons_len - (size_t)at)
             die(rf, "the SEQ of record %s is damaged", name);
          put(rf, s, cons + at, n);
-      } else if (type & 1) {
+         at += (int64_t)n;
+         continue;
+      }
+      const size_t n = bam_cigar_oplen(rf->cigar[i]);
+      if (type & 1) {
          if (n > lit->n - used)
             die(rf, "the SEQ of record %s is damaged", name);
          put(rf, s, lit->s + used, n);
@@ -479,6 +491,7 @@ static void decode_seq(RamFile *rf, const char *name, int32_t pos, size_t ncigar
       }
       if (type & 2)
          at += (int64_t)n;
+      ++i;
    }
    if (used != lit->n)
       die(rf, "the SEQ of record %s is damaged", name);
@@ -488,16 +501,12 @@ static void decode_seq(RamFile *rf, const char *name, int32_t pos, size_t ncigar
       if (p >= s->n)
          die(rf, "the SEQ of record %s is damaged", name);
       const unsigned code = rf->diffs[k] & ((1U << kDiffCodeBits) - 1);
-      if (code < kSubOther) {
-         const char *c = s->s[p] ? strchr(kAcgt, s->s[p]) : NULL;
-         if (c == NULL)
-            die(rf, "the SEQ of record %s is damaged", name);
-         s->s[p] = kAcgt[((size_t)(c - kAcgt) + code + 1) % 4];
-      } else if (code - kSubOther < 16) {
-         s->s[p] = kBases[code - kSubOther];
-      } else {
+      const char base = code < kSubOther        ? kSubstitute[code][(unsigned char)s->s[p]]
+                        : code - kSubOther < 16 ? kBases[code - kSubOther]
+                                                : '\0';
+      if (base == '\0')
          die(rf, "the SEQ of record %s is damaged", name);
-      }
+      s->s[p] = base;
    }
    reserve(rf, s, 1);
    s->s[s->n] = '\0';
