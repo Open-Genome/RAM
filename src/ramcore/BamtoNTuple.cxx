@@ -1,4 +1,5 @@
 #include "ramcore/BamtoNTuple.h"
+#include "ramcore/CigarOps.h"
 #include "ramcore/RecordBlocks.h"
 
 #include "rntuple/RAMNTupleRecord.h"
@@ -31,17 +32,32 @@
 
 namespace {
 
-std::string GetSeq(const bam1_t *b)
+// SEQ as text in htslib's alphabet, "=ACMGRSVTWYHKDBN", which is already the
+// form RAMNTupleUtils::NormalizeSequence() gives: two bases a byte, by table.
+void SetSeq(RAMNTupleRecord *rec, const bam1_t *b)
 {
+   static const std::array<std::array<char, 2>, 256> kPairs = [] {
+      std::array<std::array<char, 2>, 256> t{};
+      for (std::size_t i = 0; i < t.size(); i++)
+         t[i] = {seq_nt16_str[i >> 4], seq_nt16_str[i & 0xF]};
+      return t;
+   }();
    const int len = b->core.l_qseq;
    // A BAM record with no sequence is SEQ "*" in SAM, not an empty column.
-   if (len <= 0)
-      return "*";
+   if (len <= 0) {
+      rec->seq = "*";
+      return;
+   }
+   const auto n = static_cast<std::size_t>(len);
    const uint8_t *enc = bam_get_seq(b);
-   std::string s(static_cast<std::size_t>(len), 'N');
-   for (int i = 0; i < len; ++i)
-      s[static_cast<std::size_t>(i)] = seq_nt16_str[bam_seqi(enc, i)];
-   return s;
+   rec->seq.resize(n);
+   char *out = rec->seq.data();
+   for (std::size_t i = 0; i < n / 2; i++) {
+      out[2 * i] = kPairs[enc[i]][0];
+      out[2 * i + 1] = kPairs[enc[i]][1];
+   }
+   if (n % 2 != 0)
+      out[n - 1] = kPairs[enc[n / 2]][0];
 }
 
 std::string GetQual(const bam1_t *b)
@@ -53,25 +69,23 @@ std::string GetQual(const bam1_t *b)
    if (q == nullptr || q[0] == 0xff)
       return "*";
    std::string s(static_cast<std::size_t>(len), '!');
-   for (int i = 0; i < len; ++i)
-      s[static_cast<std::size_t>(i)] = static_cast<char>(q[i] + 33);
+   // Through a pointer: a store through s[i] could change s, as far as the
+   // compiler knows, which keeps it from vectorising the loop.
+   char *out = s.data();
+   for (std::size_t i = 0; i < s.size(); ++i)
+      out[i] = static_cast<char>(q[i] + 33);
    return s;
 }
 
-std::string GetCigar(const bam1_t *b)
+// BAM's operation codes and 28-bit lengths are RAM's (CigarOps.h).
+void SetCigar(RAMNTupleRecord *rec, const bam1_t *b)
 {
-   const uint32_t n = b->core.n_cigar;
-   if (n == 0)
-      return "*";
    const uint32_t *cigar = bam_get_cigar(b);
-   static constexpr std::array<char, 9> ops = {'M', 'I', 'D', 'N', 'S', 'H', 'P', '=', 'X'};
-   std::string s;
-   s.reserve(n * 4U);
-   for (uint32_t i = 0; i < n; ++i) {
-      s += std::to_string(bam_cigar_oplen(cigar[i]));
-      s += ops.at(static_cast<std::size_t>(bam_cigar_op(cigar[i])));
+   rec->cigar.assign(cigar, cigar + b->core.n_cigar);
+   for (const uint32_t op : rec->cigar) {
+      if (bam_cigar_op(op) > RAM_CIGAR_X)
+         throw std::runtime_error(std::string("unknown CIGAR operation in ") + bam_get_qname(b));
    }
-   return s;
 }
 
 // Every aux field as SAM text, formatted by htslib as samtools view prints it.
@@ -109,11 +123,11 @@ void FillRecord(RAMNTupleRecord *rec, const bam1_t *b, const sam_hdr_t *hdr, uin
    rec->refid = rnames.GetRefId(rname);
    rec->SetPOS(static_cast<int32_t>(b->core.pos + 1));
    rec->SetMAPQ(b->core.qual);
-   rec->SetCIGAR(GetCigar(b));
+   SetCigar(rec, b);
    rec->refnext = rnexts.GetRefId(rnext);
    rec->SetMate(static_cast<int32_t>(b->core.mpos + 1), static_cast<int32_t>(b->core.isize),
                 RAMMateOnSameRef(rname, rnext));
-   rec->SetSEQ(GetSeq(b));
+   SetSeq(rec, b);
    rec->SetQUAL(GetQual(b));
    tags.Split(GetTags(b), *rec);
 }
