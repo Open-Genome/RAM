@@ -5,7 +5,9 @@
 // compressed with htscodecs' name tokeniser (tok3, CRAM 3.1's codec), in
 // "nameblock", and its lossless qualities in "qualblock", compressed with
 // htscodecs' rANS Nx16 as CRAM 3.1 compresses its quality series, or with
-// fqzcomp when asked for. METADATA lists the row each block ends on.
+// fqzcomp when asked for. It also carries the consensus of the block's aligned
+// bases, which the SEQ of its aligned reads is coded against, as CRAM's
+// embed_ref=2 slices are. METADATA lists the row each block ends on.
 
 #include "rntuple/RAMFile.h"
 #include "rntuple/RAMNTupleRecord.h"
@@ -25,6 +27,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 /// Records per block, as many as a CRAM slice. A region query decodes every
@@ -33,10 +36,16 @@
 /// against 62.9 MB with 5,000 and 58.9 MB with 100,000; for fqzcomp it keeps
 /// all but a percent of 25,000's gain at less than half the decode time.
 constexpr std::size_t kBlockRecords = 10000;
-/// Lossless quality values per block at most, as CRAM caps a slice at 500
-/// bases per record of kBlockRecords. Without it a block of 10,000 PacBio HiFi
-/// reads held 150 MB of qualities, all decoded for a region of one base.
+/// Bases, or lossless quality values, per block at most, as CRAM caps a slice
+/// at 500 bases per record of kBlockRecords. Without it a block of 10,000
+/// PacBio HiFi reads held 150 MB of qualities, all decoded for a region of one
+/// base; the writer also holds a whole block's records until it ends.
 constexpr std::size_t kBlockBases = 500 * kBlockRecords;
+/// Reference bases a block's consensus covers at most, from its leftmost read.
+/// A sorted block of short reads covers about 50 kb and one of HiFi reads
+/// about 110 kb; the cap bounds the writer's base counts (20 bytes a base) on
+/// unsorted or very sparse input, whose reads past it keep SEQ as text.
+constexpr std::int64_t kMaxConsensusSpan = 1 << 20;
 /// Blocks decoded ahead during a scan. Four keep up with a full dump of fqzcomp
 /// blocks, and each fqzcomp decoder holds a 68 MB model, so more only costs
 /// memory.
@@ -45,44 +54,79 @@ constexpr std::size_t kQualityReadAhead = 4;
 /// and a dump writes its records in about 15, so two are plenty.
 constexpr std::size_t kNameReadAhead = 2;
 
-/// Holds one record back so the record that ends a block can carry it. Every
-/// record's name goes into its block. A quality goes into a block when it is
-/// lossless SAM text in '!'..'~'; the rest stay in the record. The block is
-/// compressed with fqzcomp when its records' policy has kFqzcomp, and with rANS
-/// otherwise.
+/// Holds a block's records until it ends, so that their SEQ can be coded
+/// against the block's consensus and the record that ends the block can carry
+/// it. Every record's name goes into its block. A quality goes into a block
+/// when it is lossless SAM text in '!'..'~'; the rest stay in the record. The
+/// block is compressed with fqzcomp when its records' policy has kFqzcomp, and
+/// with rANS otherwise.
 class BlockWriter {
 public:
    using FillFn = std::function<void(ROOT::REntry &)>;
 
-   BlockWriter(std::unique_ptr<ROOT::REntry> first, std::unique_ptr<ROOT::REntry> second, FillFn fill,
-               std::size_t block_records = kBlockRecords, std::size_t block_bases = kBlockBases);
+   /// With \p background, a block that ends is coded on another thread while
+   /// the next one fills, for a caller that writes on one thread; its rows are
+   /// still filled in order on the caller's thread.
+   BlockWriter(std::unique_ptr<ROOT::REntry> entry, FillFn fill, std::size_t block_records = kBlockRecords,
+               std::size_t block_bases = kBlockBases, bool background = false);
+   ~BlockWriter();
+   BlockWriter(const BlockWriter &) = delete;
+   BlockWriter &operator=(const BlockWriter &) = delete;
+   BlockWriter(BlockWriter &&) = delete;
+   BlockWriter &operator=(BlockWriter &&) = delete;
 
-   RAMNTupleRecord &Record() { return *m_records.at(m_current); }
+   /// The record to fill next. It may hold an earlier record's values.
+   RAMNTupleRecord &Record();
    void Add();
-   /// Ends the current block; needed before the written rows are flushed.
+   /// Ends the current block and fills every row; needed before the written
+   /// rows are flushed.
    void Finish();
    /// Last row of each block finished since the previous call, counted from the
    /// first row after it.
    std::vector<uint64_t> TakeBlockEnds();
 
 private:
-   std::array<std::unique_ptr<ROOT::REntry>, 2> m_entries;
-   std::array<RAMNTupleRecord *, 2> m_records{};
-   std::array<std::vector<std::uint8_t> *, 2> m_qualBlobs{};
-   std::array<std::vector<std::uint8_t> *, 2> m_nameBlobs{};
+   /// A block's records and what is coded from them. Encode() uses nothing
+   /// else, so it can run on another thread.
+   struct Block {
+      std::vector<RAMNTupleRecord> records; ///< Reused: holds at least `rows` records.
+      std::size_t rows = 0;
+      std::size_t bases = 0;
+      std::string names; ///< Each ended by '\0'.
+      std::string quals;
+      std::vector<uint32_t> lengths;
+      std::vector<uint32_t> flags;
+      bool fqzcomp = false;                             ///< A record of the block asked for fqzcomp.
+      std::vector<std::array<std::uint32_t, 5>> counts; ///< A, C, G, T and others per consensus base.
+      std::string consensus;
+      std::int32_t consensusPos = 0;
+      std::vector<std::uint8_t> qualBlob;
+      std::vector<std::uint8_t> nameBlob;
+   };
+
+   /// Fills the previous block and encodes this one.
+   void EndBlock();
+   static void Encode(Block &b);
+   /// Sets the records' stored SEQ and the block's consensus.
+   static void CodeSequences(Block &b);
+   /// Fills the rows of an encoded block, in order, and empties it.
+   void Fill(Block &b);
+
+   std::unique_ptr<ROOT::REntry> m_entry;
+   ROOT::RFieldToken m_recordToken;
+   std::vector<std::uint8_t> *m_qualBlob = nullptr;
+   std::vector<std::uint8_t> *m_nameBlob = nullptr;
+   std::string *m_consensus = nullptr;
+   std::int32_t *m_consensusPos = nullptr;
    FillFn m_fill;
    std::size_t m_blockRecords;
    std::size_t m_blockBases;
-   std::size_t m_current = 0;
-   bool m_pending = false;
-   std::size_t m_rows = 0;
+   bool m_background;
+   Block m_open;   ///< Filled through Record() and Add().
+   Block m_closed; ///< Ended; being encoded while m_encoding is valid.
    uint64_t m_rowsSinceTake = 0;
-   std::string m_names; ///< The block's names, each ended by '\0'.
-   std::string m_quals;
-   std::vector<uint32_t> m_lengths;
-   std::vector<uint32_t> m_flags;
-   bool m_fqzcomp = false; ///< A record of the block asked for fqzcomp.
    std::vector<uint64_t> m_blockEnds;
+   std::future<void> m_encoding;
 };
 
 /// Returns QUAL as SAM text, decoding one block at a time and decoding ahead on
@@ -152,6 +196,40 @@ private:
    uint64_t m_firstRow = 0;
    Block m_current;
    std::map<std::size_t, std::future<Block>> m_ahead;
+};
+
+/// Returns SEQ, rebuilding the bases its record codes against its block's
+/// consensus.
+class SeqBlockReader {
+public:
+   explicit SeqBlockReader(RAMFile &file);
+
+   /// Valid until the next call.
+   std::string_view Get(const RAMNTupleRecord &rec, ROOT::NTupleSize_t row);
+
+private:
+   static constexpr std::size_t kNoBlock = static_cast<std::size_t>(-1);
+
+   /// A stretch of SEQ copied from the consensus or from seq_lit.
+   struct Piece {
+      std::size_t to;
+      std::size_t from;
+      std::size_t length;
+      bool literal;
+   };
+
+   /// Rebuilds the SEQ of \p rec, row \p row, into m_seq.
+   void Decode(const RAMNTupleRecord &rec, ROOT::NTupleSize_t row);
+
+   ROOT::RNTupleView<std::string> m_consensusView;
+   ROOT::RNTupleView<std::int32_t> m_posView;
+   std::vector<uint64_t> m_ends; ///< Last row of each block.
+   std::size_t m_block = kNoBlock;
+   uint64_t m_firstRow = 0;
+   std::string m_consensus;
+   std::int32_t m_pos = 0;
+   std::vector<Piece> m_pieces;
+   std::string m_seq;
 };
 
 #endif // RAMCORE_RECORDBLOCKS_H

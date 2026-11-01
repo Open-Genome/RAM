@@ -9,6 +9,7 @@
 #include <htscodecs/rANS_static4x16.h>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -147,27 +148,186 @@ void CheckBlockEnds(const std::vector<uint64_t> &ends, ROOT::NTupleSize_t rows)
    }
 }
 
+// What a CIGAR operation consumes, as htslib's bam_cigar_type() says it.
+constexpr int kRead = 1;
+constexpr int kRef = 2;
+constexpr int kReadAndRef = kRead | kRef;
+
+// kRead, kRef, both or neither; -1 for an operation SAM does not have.
+int CigarType(uint32_t op)
+{
+   switch (op & 0xF) {
+   case RAM_CIGAR_M:
+   case RAM_CIGAR_EQUAL:
+   case RAM_CIGAR_X: return kReadAndRef;
+   case RAM_CIGAR_I:
+   case RAM_CIGAR_S: return kRead;
+   case RAM_CIGAR_D:
+   case RAM_CIGAR_N: return kRef;
+   case RAM_CIGAR_H:
+   case RAM_CIGAR_P: return 0;
+   default: return -1;
+   }
+}
+
+constexpr std::string_view kAcgt = "ACGT";
+// SEQ's alphabet in htslib's 4-bit order; RAMNTupleUtils::NormalizeSequence() gives only these.
+constexpr std::string_view kBases = "=ACMGRSVTWYHKDBN";
+// A seq_diff code below kSubOther picks one of the three bases other than the
+// consensus's A, C, G or T, as CRAM codes substitutions; from kSubOther up it
+// is kBases[code - kSubOther].
+constexpr int kSubOther = 3;
+// A seq_diff holds its code in the low bits and its step from the previous
+// difference above them.
+constexpr unsigned kDiffCodeBits = 5;
+constexpr std::size_t kMaxDiffStep = (std::size_t{1} << (32 - kDiffCodeBits)) - 1;
+
+// A, C, G and T as 0 to 3, every other byte as -1: a table, since the writer
+// looks up every aligned base.
+constexpr std::array<std::int8_t, 256> kAcgtIndex = [] {
+   std::array<std::int8_t, 256> t{};
+   for (auto &v : t)
+      v = -1;
+   for (std::size_t i = 0; i < kAcgt.size(); i++)
+      t[static_cast<unsigned char>(kAcgt[i])] = static_cast<std::int8_t>(i);
+   return t;
+}();
+
+// A count's slot for each byte: A, C, G and T, then one for every other byte,
+// which no consensus base comes from. It spares the counting loop a branch.
+constexpr std::size_t kOtherSlot = 4;
+constexpr std::array<std::uint8_t, 256> kCountSlot = [] {
+   std::array<std::uint8_t, 256> t{};
+   for (auto &v : t)
+      v = kOtherSlot;
+   for (std::size_t i = 0; i < kAcgt.size(); i++)
+      t[static_cast<unsigned char>(kAcgt[i])] = static_cast<std::uint8_t>(i);
+   return t;
+}();
+
+int Acgt(char base)
+{
+   return kAcgtIndex[static_cast<unsigned char>(base)];
+}
+
+// Whether the SEQ of \p rec can be coded against a consensus: a placed, mapped
+// read whose CIGAR accounts for every base. If so, sets \p end to its reference end.
+bool Codable(const RAMNTupleRecord &rec, std::int64_t &end)
+{
+   if (rec.refid < 0 || rec.pos < 0 || (rec.flag & 0x4) || rec.cigar.empty() || rec.seq.empty() || rec.seq == "*")
+      return false;
+   std::uint64_t bases = 0;
+   std::int64_t span = 0;
+   for (const uint32_t op : rec.cigar) {
+      const int type = CigarType(op);
+      if (type < 0)
+         return false;
+      if (type & kRead)
+         bases += op >> 4;
+      if (type & kRef)
+         span += op >> 4;
+   }
+   if (bases != rec.seq.size())
+      return false;
+   end = rec.pos + span;
+   return true;
+}
+
+// The seq_diff code of \p base where the consensus has \p cons; -1 for a base outside kBases.
+int SubCode(char base, char cons)
+{
+   const int b = Acgt(base);
+   const int c = Acgt(cons);
+   if (b >= 0 && c >= 0)
+      return (b - c + 4) % 4 - 1;
+   const auto i = kBases.find(base);
+   return i == std::string_view::npos ? -1 : kSubOther + static_cast<int>(i);
+}
+
+// Fills the stored SEQ of \p rec, which Codable() accepted, against \p consensus
+// starting at \p lo. False, leaving the fields half filled, for a base outside kBases.
+bool CodeAgainst(RAMNTupleRecord &rec, std::string_view consensus, std::int64_t lo)
+{
+   std::size_t q = 0;
+   auto at = static_cast<std::size_t>(rec.pos - lo);
+   std::size_t last = 0;
+   for (const uint32_t op : rec.cigar) {
+      const int type = CigarType(op);
+      const std::size_t n = op >> 4;
+      if (type == kReadAndRef) {
+         // Most bases match: skip to each difference, 16 bytes at a time.
+         constexpr std::size_t kStride = 16;
+         const char *read = rec.seq.data() + q;
+         const char *cons = consensus.data() + at;
+         for (std::size_t k = 0; k < n; k++) {
+            while (n - k >= kStride && std::memcmp(read + k, cons + k, kStride) == 0)
+               k += kStride;
+            while (k < n && read[k] == cons[k])
+               k++;
+            if (k == n)
+               break;
+            const int code = SubCode(read[k], cons[k]);
+            if (code < 0)
+               return false;
+            if (q + k - last > kMaxDiffStep)
+               return false;
+            rec.seq_diff.push_back(static_cast<uint32_t>((q + k - last) << kDiffCodeBits) |
+                                   static_cast<uint32_t>(code));
+            last = q + k;
+         }
+      } else if (type & kRead) {
+         rec.seq_lit.append(rec.seq, q, n);
+      }
+      if (type & kRead)
+         q += n;
+      if (type & kRef)
+         at += n;
+   }
+   return true;
+}
+
 } // namespace
 
-BlockWriter::BlockWriter(std::unique_ptr<ROOT::REntry> first, std::unique_ptr<ROOT::REntry> second, FillFn fill,
-                         std::size_t block_records, std::size_t block_bases)
-   : m_entries{std::move(first), std::move(second)},
+BlockWriter::BlockWriter(std::unique_ptr<ROOT::REntry> entry, FillFn fill, std::size_t block_records,
+                         std::size_t block_bases, bool background)
+   : m_entry(std::move(entry)),
+     m_recordToken(m_entry->GetToken("record")),
+     m_qualBlob(m_entry->GetPtr<std::vector<std::uint8_t>>(RAMNTupleRecord::kQualBlockField).get()),
+     m_nameBlob(m_entry->GetPtr<std::vector<std::uint8_t>>(RAMNTupleRecord::kNameBlockField).get()),
+     m_consensus(m_entry->GetPtr<std::string>(RAMNTupleRecord::kConsensusField).get()),
+     m_consensusPos(m_entry->GetPtr<std::int32_t>(RAMNTupleRecord::kConsensusPosField).get()),
      m_fill(std::move(fill)),
      m_blockRecords(std::max<std::size_t>(block_records, 1)),
-     m_blockBases(block_bases)
+     m_blockBases(block_bases),
+     m_background(background)
 {
-   for (std::size_t i = 0; i < 2; i++) {
-      m_records.at(i) = m_entries.at(i)->GetPtr<RAMNTupleRecord>("record").get();
-      m_qualBlobs.at(i) = m_entries.at(i)->GetPtr<std::vector<std::uint8_t>>(RAMNTupleRecord::kQualBlockField).get();
-      m_nameBlobs.at(i) = m_entries.at(i)->GetPtr<std::vector<std::uint8_t>>(RAMNTupleRecord::kNameBlockField).get();
-   }
+   // Fill() binds records untyped, which skips ROOT's type check per row (27
+   // string compares a record); check the type once here instead.
+   m_entry->GetPtr<RAMNTupleRecord>(m_recordToken);
+   m_open.records.reserve(std::min(m_blockRecords, kBlockRecords));
+}
+
+BlockWriter::~BlockWriter()
+{
+   // The encoding thread uses m_closed; wait for it, and drop what it threw:
+   // a destructor runs with a block still encoding only when the conversion
+   // has already failed.
+   if (m_encoding.valid())
+      m_encoding.wait();
+}
+
+RAMNTupleRecord &BlockWriter::Record()
+{
+   if (m_open.records.size() == m_open.rows)
+      m_open.records.emplace_back();
+   return m_open.records[m_open.rows];
 }
 
 void BlockWriter::Add()
 {
-   RAMNTupleRecord &rec = *m_records.at(m_current);
-   m_names += rec.qname;
-   m_names += '\0';
+   RAMNTupleRecord &rec = m_open.records.at(m_open.rows);
+   m_open.names += rec.qname;
+   m_open.names += '\0';
 
    // kFqzcomp comes in from the quality policy and picks the block's codec;
    // kQualInBlock goes out meaning the quality is in the block. fqzcomp takes
@@ -175,75 +335,198 @@ void BlockWriter::Add()
    // their bytes only read back through DecodeQuality, and binned qualities
    // from Q30 up look like SAM quality text.
    if (rec.TestBit(RAMNTupleRecord::kFqzcomp))
-      m_fqzcomp = true;
+      m_open.fqzcomp = true;
    rec.compression_flags &= ~static_cast<uint32_t>(RAMNTupleRecord::kFqzcomp);
    const bool lossless = !rec.TestBit(RAMNTupleRecord::kIlluminaBinning | RAMNTupleRecord::kDrop);
    if (lossless && rec.qual != "*" && !rec.qual.empty() && IsSamQuality(rec.qual)) {
       for (const char c : rec.qual)
-         m_quals.push_back(static_cast<char>(c - '!'));
-      m_lengths.push_back(static_cast<uint32_t>(rec.qual.size()));
-      m_flags.push_back(((rec.flag & 0x10) ? FQZ_FREVERSE : 0) | ((rec.flag & 0x80) ? FQZ_FREAD2 : 0));
+         m_open.quals.push_back(static_cast<char>(c - '!'));
+      m_open.lengths.push_back(static_cast<uint32_t>(rec.qual.size()));
+      m_open.flags.push_back(((rec.flag & 0x10) ? FQZ_FREVERSE : 0) | ((rec.flag & 0x80) ? FQZ_FREAD2 : 0));
       rec.qual.clear();
       rec.SetBit(RAMNTupleRecord::kQualInBlock);
    } else {
       rec.compression_flags &= ~static_cast<uint32_t>(RAMNTupleRecord::kQualInBlock);
    }
-   m_rows++;
-
-   if (m_pending)
-      m_fill(*m_entries.at(1 - m_current));
-   m_pending = true;
-   m_current = 1 - m_current;
-   if (m_rows == m_blockRecords || m_quals.size() >= m_blockBases)
-      Finish();
+   m_open.bases += rec.seq.size();
+   m_open.rows++;
+   if (m_open.rows == m_blockRecords || m_open.quals.size() >= m_blockBases || m_open.bases >= m_blockBases)
+      EndBlock();
 }
 
 void BlockWriter::Finish()
 {
-   if (!m_pending)
-      return;
-   const std::size_t last = 1 - m_current;
-   if (!m_lengths.empty() && m_fqzcomp) {
+   if (m_open.rows > 0)
+      EndBlock();
+   if (m_encoding.valid()) {
+      m_encoding.get();
+      Fill(m_closed);
+   }
+}
+
+void BlockWriter::EndBlock()
+{
+   if (m_encoding.valid()) {
+      m_encoding.get();
+      Fill(m_closed);
+   }
+   // Swapping keeps both blocks' buffers for reuse.
+   std::swap(m_open, m_closed);
+   if (m_background) {
+      m_encoding = std::async(std::launch::async, [this] { Encode(m_closed); });
+   } else {
+      Encode(m_closed);
+      Fill(m_closed);
+   }
+}
+
+void BlockWriter::Encode(Block &b)
+{
+   CodeSequences(b);
+   if (!b.lengths.empty() && b.fqzcomp) {
       fqz_slice slice{};
-      slice.num_records = static_cast<int>(m_lengths.size());
-      slice.len = m_lengths.data();
-      slice.flags = m_flags.data();
+      slice.num_records = static_cast<int>(b.lengths.size());
+      slice.len = b.lengths.data();
+      slice.flags = b.flags.data();
       std::size_t size = 0;
       char *packed =
-         fqz_compress(kFqzVersion, &slice, m_quals.data(), m_quals.size(), &size, kFqzStrategy, /*gp=*/nullptr);
+         fqz_compress(kFqzVersion, &slice, b.quals.data(), b.quals.size(), &size, kFqzStrategy, /*gp=*/nullptr);
       if (!packed)
          throw std::runtime_error("fqzcomp could not compress a quality block");
       const std::string_view bytes(packed, size);
-      m_qualBlobs.at(last)->assign(1, kQualFqzcomp);
-      m_qualBlobs.at(last)->insert(m_qualBlobs.at(last)->end(), bytes.begin(), bytes.end());
+      b.qualBlob.assign(1, kQualFqzcomp);
+      b.qualBlob.insert(b.qualBlob.end(), bytes.begin(), bytes.end());
       free(packed); // NOLINT(cppcoreguidelines-owning-memory,cppcoreguidelines-no-malloc): allocated by htscodecs
-   } else if (!m_lengths.empty()) {
-      const std::string bytes = RansBlock(m_lengths, m_quals);
-      m_qualBlobs.at(last)->assign(bytes.begin(), bytes.end());
+   } else if (!b.lengths.empty()) {
+      const std::string bytes = RansBlock(b.lengths, b.quals);
+      b.qualBlob.assign(bytes.begin(), bytes.end());
    }
    int size = 0;
    int lastStart = 0;
-   uint8_t *names = tok3_encode_names(m_names.data(), static_cast<int>(m_names.size()), kTok3Level,
+   uint8_t *names = tok3_encode_names(b.names.data(), static_cast<int>(b.names.size()), kTok3Level,
                                       /*use_arith=*/0, &size, &lastStart);
    if (!names)
       throw std::runtime_error("the name tokeniser could not compress a block of names");
-   m_nameBlobs.at(last)->resize(static_cast<std::size_t>(size));
-   std::memcpy(m_nameBlobs.at(last)->data(), names, static_cast<std::size_t>(size));
+   b.nameBlob.resize(static_cast<std::size_t>(size));
+   std::memcpy(b.nameBlob.data(), names, static_cast<std::size_t>(size));
    free(names); // NOLINT(cppcoreguidelines-owning-memory,cppcoreguidelines-no-malloc): allocated by htscodecs
+}
 
-   m_fill(*m_entries.at(last));
-   m_qualBlobs.at(last)->clear();
-   m_nameBlobs.at(last)->clear();
+void BlockWriter::Fill(Block &b)
+{
+   // RNTuple copies a record's values when it fills a row, so binding the
+   // block's records in turn saves copying them into the entry.
+   for (std::size_t i = 0; i + 1 < b.rows; i++) {
+      m_entry->BindRawPtr<void>(m_recordToken, &b.records[i]);
+      m_fill(*m_entry);
+   }
+   m_qualBlob->swap(b.qualBlob);
+   m_nameBlob->swap(b.nameBlob);
+   m_consensus->swap(b.consensus);
+   *m_consensusPos = b.consensusPos;
+   m_entry->BindRawPtr<void>(m_recordToken, &b.records[b.rows - 1]);
+   m_fill(*m_entry);
+   m_qualBlob->clear();
+   m_nameBlob->clear();
+   m_consensus->clear();
+   *m_consensusPos = 0;
 
-   m_rowsSinceTake += m_rows;
+   m_rowsSinceTake += b.rows;
    m_blockEnds.push_back(m_rowsSinceTake - 1);
-   m_pending = false;
-   m_rows = 0;
-   m_names.clear();
-   m_quals.clear();
-   m_lengths.clear();
-   m_flags.clear();
-   m_fqzcomp = false;
+   b.rows = 0;
+   b.bases = 0;
+   b.names.clear();
+   b.quals.clear();
+   b.lengths.clear();
+   b.flags.clear();
+   b.fqzcomp = false;
+   b.qualBlob.clear();
+   b.nameBlob.clear();
+}
+
+void BlockWriter::CodeSequences(Block &b)
+{
+   // Reads are coded against the reference that has the most of the block's
+   // aligned bases; reads on the others keep SEQ as text, as do reads past
+   // kMaxConsensusSpan. ends[i] is the reference end of a read to code, else -1.
+   std::vector<std::int64_t> ends(b.rows, -1);
+   std::vector<std::pair<std::int32_t, std::uint64_t>> basesByRef;
+   for (std::size_t i = 0; i < b.rows; i++) {
+      const RAMNTupleRecord &rec = b.records[i];
+      if (!Codable(rec, ends[i]))
+         continue;
+      auto it = std::find_if(basesByRef.begin(), basesByRef.end(), [&](const auto &r) { return r.first == rec.refid; });
+      if (it == basesByRef.end())
+         it = basesByRef.insert(basesByRef.end(), {rec.refid, 0});
+      it->second += rec.seq.size();
+   }
+   const auto most = std::max_element(basesByRef.begin(), basesByRef.end(),
+                                      [](const auto &x, const auto &y) { return x.second < y.second; });
+   const std::int32_t refid = most == basesByRef.end() ? -1 : most->first;
+
+   std::int64_t lo = std::numeric_limits<std::int64_t>::max();
+   for (std::size_t i = 0; i < b.rows; i++) {
+      if (ends[i] >= 0 && b.records[i].refid != refid)
+         ends[i] = -1;
+      if (ends[i] >= 0)
+         lo = std::min<std::int64_t>(lo, b.records[i].pos);
+   }
+   std::int64_t hi = lo;
+   for (std::size_t i = 0; i < b.rows; i++) {
+      if (ends[i] >= 0 && ends[i] - lo > kMaxConsensusSpan)
+         ends[i] = -1;
+      if (ends[i] >= 0)
+         hi = std::max(hi, ends[i]);
+   }
+
+   // The consensus: the commonest of A, C, G and T at each base, N where none.
+   std::string &consensus = b.consensus;
+   consensus.clear();
+   if (refid >= 0) {
+      b.counts.assign(static_cast<std::size_t>(hi - lo), {});
+      for (std::size_t i = 0; i < b.rows; i++) {
+         if (ends[i] < 0)
+            continue;
+         const RAMNTupleRecord &rec = b.records[i];
+         std::size_t q = 0;
+         auto at = static_cast<std::size_t>(rec.pos - lo);
+         for (const uint32_t op : rec.cigar) {
+            const int type = CigarType(op);
+            const std::size_t n = op >> 4;
+            if (type == kReadAndRef) {
+               const char *read = rec.seq.data() + q;
+               auto *count = b.counts.data() + at;
+               for (std::size_t k = 0; k < n; k++)
+                  count[k][kCountSlot[static_cast<unsigned char>(read[k])]]++;
+            }
+            if (type & kRead)
+               q += n;
+            if (type & kRef)
+               at += n;
+         }
+      }
+      consensus.assign(b.counts.size(), 'N');
+      for (std::size_t i = 0; i < b.counts.size(); i++) {
+         const auto &c = b.counts[i];
+         const auto best = std::max_element(c.begin(), c.begin() + kOtherSlot);
+         if (*best > 0)
+            consensus[i] = kAcgt[static_cast<std::size_t>(best - c.begin())];
+      }
+   }
+
+   for (std::size_t i = 0; i < b.rows; i++) {
+      RAMNTupleRecord &rec = b.records[i];
+      rec.seq_lit.clear();
+      rec.seq_diff.clear();
+      rec.compression_flags &= ~static_cast<uint32_t>(RAMNTupleRecord::kSeqConsensus);
+      if (ends[i] >= 0 && CodeAgainst(rec, consensus, lo)) {
+         rec.SetBit(RAMNTupleRecord::kSeqConsensus);
+      } else {
+         rec.seq_lit = rec.seq;
+         rec.seq_diff.clear();
+      }
+   }
+   b.consensusPos = refid < 0 ? 0 : static_cast<std::int32_t>(lo);
 }
 
 std::vector<uint64_t> BlockWriter::TakeBlockEnds()
@@ -420,5 +703,100 @@ void NameBlockReader::Load(std::size_t block)
    for (std::size_t next = block + 1; next < m_ends.size() && next <= block + depth; next++) {
       if (m_ahead.count(next) == 0)
          m_ahead.emplace(next, std::async(std::launch::async, Decode, Read(next), next, rows(next)));
+   }
+}
+
+SeqBlockReader::SeqBlockReader(RAMFile &file)
+   : m_consensusView(file.GetReader().GetView<std::string>(RAMNTupleRecord::kConsensusField)),
+     m_posView(file.GetReader().GetView<std::int32_t>(RAMNTupleRecord::kConsensusPosField)),
+     m_ends(file.GetMetadata().block_ends)
+{
+   CheckBlockEnds(m_ends, file.GetReader().GetNEntries());
+}
+
+std::string_view SeqBlockReader::Get(const RAMNTupleRecord &rec, ROOT::NTupleSize_t row)
+{
+   if (!rec.TestBit(RAMNTupleRecord::kSeqConsensus))
+      return rec.seq_lit;
+   if (m_block == kNoBlock || row < m_firstRow || row > m_ends[m_block]) {
+      const auto it = std::lower_bound(m_ends.begin(), m_ends.end(), static_cast<uint64_t>(row));
+      if (it == m_ends.end())
+         throw std::runtime_error("record " + std::to_string(row) + " has no consensus");
+      m_block = static_cast<std::size_t>(it - m_ends.begin());
+      m_firstRow = m_block == 0 ? 0 : m_ends[m_block - 1] + 1;
+      m_consensus = m_consensusView(*it);
+      m_pos = m_posView(*it);
+   }
+   Decode(rec, row);
+   return m_seq;
+}
+
+void SeqBlockReader::Decode(const RAMNTupleRecord &rec, ROOT::NTupleSize_t row)
+{
+   const auto damaged = [row] {
+      return std::runtime_error("the SEQ of record " + std::to_string(row) + " is damaged");
+   };
+   // One pass over the CIGAR finds where each stretch of SEQ comes from. Long
+   // reads have hundreds of =, X and M operations in a row, which read
+   // consecutive consensus bases and make one stretch.
+   m_pieces.clear();
+   std::size_t q = 0;
+   std::size_t lit = 0;
+   std::int64_t at = static_cast<std::int64_t>(rec.pos) - m_pos;
+   bool inRun = false;
+   for (const uint32_t op : rec.cigar) {
+      const int type = CigarType(op);
+      const std::size_t n = op >> 4;
+      if (type < 0)
+         throw damaged();
+      if (type == kReadAndRef) {
+         if (inRun) {
+            m_pieces.back().length += n;
+         } else {
+            if (at < 0)
+               throw damaged();
+            m_pieces.push_back({q, static_cast<std::size_t>(at), n, false});
+            inRun = true;
+         }
+      } else if (type != 0) {
+         inRun = false;
+         if (type & kRead) {
+            if (n > rec.seq_lit.size() - lit)
+               throw damaged();
+            m_pieces.push_back({q, lit, n, true});
+            lit += n;
+         }
+      }
+      if (type & kRead)
+         q += n;
+      if (type & kRef)
+         at += static_cast<std::int64_t>(n);
+   }
+   if (lit != rec.seq_lit.size())
+      throw damaged();
+   m_seq.resize(q);
+   for (const Piece &piece : m_pieces) {
+      const std::string_view from = piece.literal ? std::string_view(rec.seq_lit) : std::string_view(m_consensus);
+      if (piece.from > from.size() || piece.length > from.size() - piece.from)
+         throw damaged();
+      from.copy(m_seq.data() + piece.to, piece.length, piece.from);
+   }
+
+   std::size_t pos = 0;
+   for (const uint32_t diff : rec.seq_diff) {
+      pos += diff >> kDiffCodeBits;
+      if (pos >= m_seq.size())
+         throw damaged();
+      const auto code = static_cast<int>(diff & ((1U << kDiffCodeBits) - 1));
+      if (code < kSubOther) {
+         const int cons = Acgt(m_seq[pos]);
+         if (cons < 0)
+            throw damaged();
+         m_seq[pos] = kAcgt[static_cast<std::size_t>((cons + code + 1) % 4)];
+      } else if (static_cast<std::size_t>(code - kSubOther) < kBases.size()) {
+         m_seq[pos] = kBases[static_cast<std::size_t>(code - kSubOther)];
+      } else {
+         throw damaged();
+      }
    }
 }

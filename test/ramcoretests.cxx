@@ -141,21 +141,21 @@ TEST_F(ramcoreTest, RNTupleDataIntegrity)
    const char *rntupleFile = "test_rntuple.root";
    samtoramntuple(/*datafile=*/"samexample.sam", rntupleFile, /*compression_algorithm=*/505, /*quality_policy=*/0);
 
-   auto reader = ROOT::RNTupleReader::Open("RAM", rntupleFile);
-   ASSERT_NE(reader, nullptr);
+   auto file = RAMFile::Open(rntupleFile);
+   ASSERT_NE(file, nullptr);
+   ROOT::RNTupleReader *reader = &file->GetReader();
 
    auto viewPos = reader->GetView<int>("record.pos");
-   auto viewSeq = reader->GetView<std::string>("record.seq");
+   auto view = reader->GetView<RAMNTupleRecord>("record");
+   SeqBlockReader seqs(*file);
 
    ASSERT_GT(reader->GetNEntries(), 0);
 
    int firstPos = viewPos(0);
-   std::string firstSeq = viewSeq(0);
+   const std::string firstSeq(seqs.Get(view(0), 0));
 
    EXPECT_GT(firstPos, 0);
 
-   // The column holds the bases themselves, with no length prefix: the string
-   // column already records the length.
    EXPECT_EQ(firstSeq.size(), 36U);
    EXPECT_EQ(firstSeq.find_first_not_of("ACGTN"), std::string::npos) << firstSeq;
 
@@ -975,10 +975,10 @@ TEST_F(ramcoreTest, SeqSurvivesAFileAsNormalizedText)
    ASSERT_EQ(file->GetReader().GetNEntries(), 2U);
    auto view = file->GetReader().GetView<RAMNTupleRecord>("record");
 
-   EXPECT_EQ(view(0).GetSEQ(), "ACGTNYNN");
-   EXPECT_EQ(view(0).GetSEQLEN(), 8);
-   EXPECT_EQ(view(1).GetSEQ(), "*");
-   EXPECT_EQ(view(1).GetSEQLEN(), 0);
+   SeqBlockReader seqs(*file);
+
+   EXPECT_EQ(seqs.Get(view(0), 0), "ACGTNYNN");
+   EXPECT_EQ(seqs.Get(view(1), 1), "*");
 
    std::remove(customSam);
    std::remove(rntupleFile);

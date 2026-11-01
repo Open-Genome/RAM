@@ -88,6 +88,7 @@ Dump ReadBack(const char *file)
    auto view = reader.GetView<RAMNTupleRecord>("record");
    QualityBlockReader quals(*ram);
    NameBlockReader names(*ram);
+   SeqBlockReader seqs(*ram);
    for (auto i : reader.GetEntryRange()) {
       const RAMNTupleRecord &r = view(i);
       const bool sameRef = ram->MateOnSameRef(r);
@@ -95,7 +96,7 @@ Dump ReadBack(const char *file)
                          ram->GetRname(r.GetREFID()) + "\t" + std::to_string(r.GetPOS()) + "\t" +
                          std::to_string(r.GetMAPQ()) + "\t" + r.GetCIGAR() + "\t" + ram->GetRnext(r.GetREFNEXT()) +
                          "\t" + std::to_string(r.GetPNEXT(sameRef)) + "\t" + std::to_string(r.GetTLEN(sameRef)) + "\t" +
-                         r.GetSEQ() + "\t" + quals.Get(r, i);
+                         std::string(seqs.Get(r, i)) + "\t" + quals.Get(r, i);
       ram->AppendTags(r, line);
       d.lines.push_back(line);
    }
