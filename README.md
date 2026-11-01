@@ -318,7 +318,7 @@ level 10 and 509 at level 18. For a quick conversion use 501
 or 503 with `-threads`; for the smallest file, 509 at a much higher conversion
 cost. On the two slices above, 509 makes the files 7% (Illumina) and 4%
 (Revio) smaller and takes about four times as long to convert (56 s against
-16 s for the Illumina slice, 22 s against 6 s for Revio, `-threads 4`).
+15 s for the Illumina slice, 22 s against 5 s for Revio, `-threads 4`).
 Reading is no slower: a full `ramdump` takes 3.7 s and 1.0 s with either.
 
 Records are stored in blocks of 10,000 records or 5 million bases or quality
