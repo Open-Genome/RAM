@@ -105,7 +105,7 @@ becoming `reads.ram`. Options for either tool:
 
 | Option | Effect |
 |--------|--------|
-| `-compression N` | ROOT compression code, algorithm times 100 plus level; the default 505 is ZSTD level 5 (see below) |
+| `-compression N` | ROOT compression code, algorithm times 100 plus level; the default 505 is ZSTD, which ROOT runs at zstd level 10 (see below) |
 | `-threads N` | converts on N threads, see below |
 | `-illumina` | stores quality scores in Illumina's 8 bins, which makes the file smaller |
 | `-dropqual` | stores no quality scores |
@@ -236,7 +236,7 @@ reads and one of long reads:
 | Records | 1,815,389 | 14,630 |
 | Bases | 272 million | 228 million |
 
-RAM is `bamtoramntuple -threads 4` with the default ZSTD 5. CRAM is CRAM 3.1
+RAM is `bamtoramntuple -threads 4` with the default compression, 505 (zstd level 10). CRAM is CRAM 3.1
 with samtools' default profile, once against the reference
 (`samtools view -O cram,version=3.1 -T chr20.fa`) and once with
 `-O cram,version=3.1,embed_ref=2`, which stores a consensus of each slice's
@@ -309,7 +309,8 @@ whole page of every column and a whole block of names and qualities, up to
 
 `-compression N` takes a ROOT compression code, algorithm times 100 plus level:
 1 is ZLIB, 2 LZMA, 4 LZ4, 5 ZSTD, with levels 1 to 9, and 0 means no
-compression. The default is 505, ZSTD level 5. For a quick conversion use 501
+compression. ROOT hands ZSTD twice the level, so the default 505 runs zstd at
+level 10 and 509 at level 18. For a quick conversion use 501
 or 503 with `-threads`; for the smallest file, 509 at a much higher conversion
 cost. On the two slices above, 509 makes the files 8% smaller and takes about
 five times as long to convert (97 s against 22 s for the Illumina slice, 40 s

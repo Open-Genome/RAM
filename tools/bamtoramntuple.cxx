@@ -53,7 +53,7 @@ int main(int argc, char *argv[])
                 << "  -dropqual    Drop quality scores\n"
                 << "  -fqzcomp     Compress quality scores with fqzcomp instead of rANS: may be\n"
                 << "               smaller for unbinned qualities, three times the CPU to read\n"
-                << "  -compression N  ROOT compression code, algorithm*100+level (default 505, ZSTD level 5)\n"
+                << "  -compression N  ROOT compression code, algorithm*100+level (default 505: ZSTD, run by ROOT at zstd level 10)\n"
                 << "  -threads N   compress pages on N threads (default 1)\n";
       return 1;
    }
