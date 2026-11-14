@@ -17,7 +17,8 @@ The tools:
 | `bamtoramntuple` | converts a BAM file to RAM |
 | `ramdump` | writes a RAM file, or a region of it, out as SAM; takes the `samtools view` options |
 | `ramntupleview` | counts the records in a region and reports the query time |
-| `ramstats` | `idxstats` and `flagstat`, printed as `samtools idxstats` and `samtools flagstat` print them |
+| `ramstats` | `idxstats` and `flagstat`, printed as `samtools idxstats` and `samtools flagstat` print them, and `size`, the bytes each field takes |
+| `libram/ramread` | writes a RAM file, or a region of it, as SAM or BAM without ROOT; with a small htslib patch samtools reads RAM files too, see [libram/README.md](libram/README.md) |
 
 ## Installation
 
@@ -62,8 +63,8 @@ well and needs no `thisroot.sh`.
 ### 3. Build RAMTools
 
 ```bash
-git clone https://github.com/compiler-research/ramtools.git
-cd ramtools
+git clone https://github.com/Open-Genome/RAM.git
+cd RAM
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 ```
@@ -117,8 +118,10 @@ thread parses, encodes and compresses blocks of its own. The blocks are written
 in input order, so the records come out in the order they went in, whatever
 the thread count. It needs about (N + 1) × 64 MB of memory on top of ROOT's
 own: a block for every thread and one read ahead.
-`bamtoramntuple`, and `samtoramntuple` with `-split`, parse on one thread and
-use the others to compress.
+`bamtoramntuple` parses on one thread, codes each block of records (names,
+qualities, the consensus) on a second and compresses on the others;
+`samtoramntuple` with `-split` parses on one thread and compresses on the
+others.
 
 Sort the input by coordinate first, as `samtools sort` does. Region queries
 find a region by binary search over the positions, which only works on a sorted
@@ -286,10 +289,10 @@ rANS order 1, in blocks the size of a CRAM slice, and come out the same size.
 Neither stores MD and NM where it can compute them again: a CRAM from its
 reference or consensus, RAM from each block's reference (see below). On the
 Illumina reads they took 5.0 MB when RAM stored them. Both store the bases as
-differences from a consensus
-of the reads near them: RAM's SEQ row is each block's consensus, the
-substitutions against it and the soft-clipped and inserted bases. On the Revio
-reads most of the CIGAR is the `=` and `X` detail the CRAMs drop.
+differences from a consensus of the reads near them: RAM's SEQ row is each
+block's consensus, the substitutions against it and the soft-clipped and
+inserted bases. On the Revio reads most of the CIGAR is the `=` and `X` detail
+the CRAMs drop.
 
 ### Region queries
 
@@ -374,7 +377,7 @@ command that confirms your result in the description.
 
 ## Reporting a problem
 
-Open an issue at https://github.com/compiler-research/ramtools/issues. Include
+Open an issue at https://github.com/Open-Genome/RAM/issues. Include
 the command you ran, its output, your ROOT version, and for a wrong result the
 samtools command that gives the answer you expected. A few SAM lines that
 reproduce the problem are the most useful thing you can attach.

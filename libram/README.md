@@ -10,8 +10,9 @@ which htslib already ships. It is C11.
   page against its XXH3 checksum, bounds-checks every read, and decodes the
   integer, index, character and byte columns a page at a time.
 - `ram.c`, `ram.h`: RAM on top of it: METADATA, the record columns, the tag
-  orders, the blocks of names (tok3) and qualities (rANS or fqzcomp), and the
-  PNEXT and TLEN predictions. It follows ramtools' RAMNTupleRecord, RAMTags and
+  orders, the blocks of names (tok3) and qualities (rANS or fqzcomp), SEQ
+  rebuilt from each block's consensus, MD and NM rebuilt against each block's
+  reference, and the PNEXT and TLEN predictions. It follows ramtools' RAMNTupleRecord, RAMTags and
   RecordBlocks, so a change to the format needs the same change here.
 - `ramread.c`: writes a RAM file, or a region of it, as SAM or BAM through
   htslib.
