@@ -152,7 +152,8 @@ TEST_F(ramcoreTest, RNTupleDataIntegrity)
    ASSERT_GT(reader->GetNEntries(), 0);
 
    int firstPos = viewPos(0);
-   const std::string firstSeq(seqs.Get(view(0), 0));
+   RAMNTupleRecord first = view(0);
+   const std::string firstSeq(seqs.Get(first, 0));
 
    EXPECT_GT(firstPos, 0);
 
@@ -977,8 +978,10 @@ TEST_F(ramcoreTest, SeqSurvivesAFileAsNormalizedText)
 
    SeqBlockReader seqs(*file);
 
-   EXPECT_EQ(seqs.Get(view(0), 0), "ACGTNYNN");
-   EXPECT_EQ(seqs.Get(view(1), 1), "*");
+   RAMNTupleRecord rec = view(0);
+   EXPECT_EQ(seqs.Get(rec, 0), "ACGTNYNN");
+   rec = view(1);
+   EXPECT_EQ(seqs.Get(rec, 1), "*");
 
    std::remove(customSam);
    std::remove(rntupleFile);

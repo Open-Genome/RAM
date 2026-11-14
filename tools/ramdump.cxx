@@ -131,7 +131,7 @@ public:
    RecordReader &operator=(const RecordReader &) = delete;
    RecordReader &operator=(RecordReader &&) = delete;
 
-   const RAMNTupleRecord &operator()(ROOT::NTupleSize_t row)
+   RAMNTupleRecord &operator()(ROOT::NTupleSize_t row)
    {
       m_flag(row);
       m_refid(row);
@@ -311,7 +311,7 @@ int main(int argc, char *argv[])
    Long64_t kept = 0;
 
    ramntuplescan(*ram, region.c_str(), [&](Long64_t row) {
-      const auto &rec = records(row);
+      auto &rec = records(row);
       const uint16_t flag = rec.GetFLAG();
       if ((flag & requireFlags) != requireFlags || (flag & excludeFlags))
          return;

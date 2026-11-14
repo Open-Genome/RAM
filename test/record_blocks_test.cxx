@@ -295,6 +295,8 @@ struct Aligned {
    std::string cigar;
    std::string seq;
    bool coded = false; ///< Expected to be coded against the consensus, in one block.
+   std::string md{};
+   int32_t nm = 0;
 };
 
 // Writes the reads through BlockWriter, \p block records to a block, each
@@ -320,6 +322,8 @@ void WriteSeqs(const std::vector<Aligned> &reads, std::size_t block, bool backgr
          rec.SetCIGAR(read.cigar);
          rec.SetSEQ(read.seq);
          rec.SetQUAL("*");
+         rec.tag_md = read.md;
+         rec.tag_nm = read.nm;
          out.Add();
       }
       out.Finish();
@@ -365,7 +369,7 @@ void ExpectSeqs(const std::vector<Aligned> &reads, bool checkCoded)
       order.push_back(i);
    order.push_back(3);
    for (const std::size_t row : order) {
-      const RAMNTupleRecord &rec = view(row);
+      RAMNTupleRecord rec = view(row);
       EXPECT_EQ(seqs.Get(rec, row), reads[row].seq) << "row " << row;
       if (checkCoded) {
          EXPECT_EQ(rec.TestBit(RAMNTupleRecord::kSeqConsensus), reads[row].coded) << "row " << row;
@@ -450,20 +454,130 @@ TEST_F(RecordBlocksTest, DamagedSeqIsReported)
    ASSERT_NE(file, nullptr);
    auto view = file->GetReader().GetView<RAMNTupleRecord>("record");
    SeqBlockReader seqs(*file);
-   EXPECT_EQ(seqs.Get(view(0), 0), "AGGT");
-   for (const ROOT::NTupleSize_t row : {1U, 2U})
-      EXPECT_THROW(seqs.Get(view(row), row), std::runtime_error) << "row " << row;
+   RAMNTupleRecord rec = view(0);
+   EXPECT_EQ(seqs.Get(rec, 0), "AGGT");
+   for (const ROOT::NTupleSize_t row : {1U, 2U}) {
+      rec = view(row);
+      EXPECT_THROW(seqs.Get(rec, row), std::runtime_error) << "row " << row;
+   }
    // Code 3 is '=' (kBases[0]), and the base it replaces is no longer A, C, G
    // or T for the next code 0 at the same place.
-   EXPECT_THROW(seqs.Get(view(3), 3), std::runtime_error);
-   EXPECT_EQ(seqs.Get(view(4), 4), "CCGT");
+   rec = view(3);
+   EXPECT_THROW(seqs.Get(rec, 3), std::runtime_error);
+   rec = view(4);
+   EXPECT_EQ(seqs.Get(rec, 4), "CCGT");
 
    WriteCoded({{}}, "ACG");
    auto shortFile = RAMFile::Open(kFile);
    ASSERT_NE(shortFile, nullptr);
    auto shortView = shortFile->GetReader().GetView<RAMNTupleRecord>("record");
    SeqBlockReader shortSeqs(*shortFile);
-   EXPECT_THROW(shortSeqs.Get(shortView(0), 0), std::runtime_error);
+   rec = shortView(0);
+   EXPECT_THROW(shortSeqs.Get(rec, 0), std::runtime_error);
+}
+
+// Reads whose MD tags agree with the reference ACGTGCGTACAAAATTTCC from 100,
+// where the consensus has A at 104 and nothing at 112 to 114.
+const std::vector<Aligned> kTagged = {
+   {0, 100, 0, "10M", "ACGTACGTAC", true, "4G5", 1},
+   {0, 100, 0, "10M", "ACGTACGTAC", true, "4G5", 1},
+   {0, 102, 0, "4M2D4M", "GTACACAA", true, "2G1^GT4", 3},
+   // A deletion no other read covers.
+   {0, 110, 0, "2M3D2M", "AACC", true, "2^TTT2", 3},
+   {0, 100, 0, "4M", "ACNT", true, "2G1", 1},
+   // Lowercase MD does not come back from the reference, so it stays; NM does.
+   {0, 100, 0, "10M", "ACGTACGTAC", true, "4g5", 1},
+   // An NM that is not the reference's stays; MD does.
+   {0, 100, 0, "10M", "ACGTACGTAC", true, "4G5", 2},
+   // On the block's other reference: not coded, so both stay.
+   {1, 100, 0, "4M", "GGGG", false, "4", 0},
+   // NM without MD stays.
+   {0, 100, 0, "4M", "ACGT", true, "", 0},
+   {0, 100, 0, "4=1X5=", "ACGTACGTAC", true, "4G5", 1},
+};
+
+TEST_F(RecordBlocksTest, MdAndNmAreRebuiltFromTheReference)
+{
+   WriteSeqs(kTagged, kBlockRecords);
+   auto file = RAMFile::Open(kFile);
+   ASSERT_NE(file, nullptr);
+   auto view = file->GetReader().GetView<RAMNTupleRecord>("record");
+   const std::vector<std::pair<bool, bool>> rebuilt = {{true, true},   {true, true},  {true, true},  {true, true},
+                                                       {true, true},   {false, true}, {true, false}, {false, false},
+                                                       {false, false}, {true, true}};
+   for (std::size_t row = 0; row < kTagged.size(); row++) {
+      const RAMNTupleRecord &rec = view(row);
+      EXPECT_EQ(rec.TestBit(RAMNTupleRecord::kMdRebuilt), rebuilt[row].first) << "row " << row;
+      EXPECT_EQ(rec.TestBit(RAMNTupleRecord::kNmRebuilt), rebuilt[row].second) << "row " << row;
+      EXPECT_EQ(rec.tag_md.empty(), rebuilt[row].first || kTagged[row].md.empty()) << "row " << row;
+   }
+   auto patch = file->GetReader().GetView<std::vector<std::uint32_t>>(RAMNTupleRecord::kConsensusPatchField);
+   const auto base = [](std::uint32_t at, char b) { return (at << 8) | static_cast<unsigned char>(b); };
+   EXPECT_EQ(patch(kTagged.size() - 1),
+             (std::vector<std::uint32_t>{base(4, 'G'), base(12, 'T'), base(13, 'T'), base(14, 'T')}));
+   std::string tags{};
+   EXPECT_THROW(file->AppendTags(view(0), tags), std::logic_error);
+}
+
+TEST_F(RecordBlocksTest, MdAndNmComeBackFromBlocksOfAnySize)
+{
+   for (const std::size_t block : {std::size_t{1}, std::size_t{2}, std::size_t{3}, std::size_t{4}, kBlockRecords}) {
+      SCOPED_TRACE("block of " + std::to_string(block));
+      WriteSeqs(kTagged, block);
+      ExpectSeqs(kTagged, /*checkCoded=*/block == kBlockRecords);
+      auto file = RAMFile::Open(kFile);
+      ASSERT_NE(file, nullptr);
+      auto view = file->GetReader().GetView<RAMNTupleRecord>("record");
+      SeqBlockReader seqs(*file);
+      for (std::size_t row = kTagged.size(); row-- > 0;) {
+         RAMNTupleRecord rec = view(row);
+         seqs.Get(rec, row);
+         EXPECT_EQ(rec.tag_md, kTagged[row].md) << "row " << row;
+         EXPECT_EQ(rec.tag_nm, kTagged[row].nm) << "row " << row;
+         EXPECT_FALSE(rec.TestBit(RAMNTupleRecord::kMdRebuilt | RAMNTupleRecord::kNmRebuilt)) << "row " << row;
+      }
+   }
+}
+
+TEST_F(RecordBlocksTest, DamagedReferenceIsReported)
+{
+   // Rows: a patch past the consensus; MD to rebuild without a consensus; a
+   // deletion that runs past the reference.
+   const std::vector<std::pair<uint32_t, std::string>> rows = {
+      {RAMNTupleRecord::kSeqConsensus | RAMNTupleRecord::kMdRebuilt, "4M"},
+      {RAMNTupleRecord::kMdRebuilt, "4M"},
+      {RAMNTupleRecord::kSeqConsensus | RAMNTupleRecord::kNmRebuilt, "2M5D"}};
+   for (std::size_t i = 0; i < rows.size(); i++) {
+      SCOPED_TRACE("row " + std::to_string(i));
+      {
+         std::unique_ptr<TFile> file(TFile::Open(kFile, "RECREATE"));
+         RAMFileMetadata meta;
+         meta.rname_refs = {"chr1"};
+         {
+            auto writer = ROOT::RNTupleWriter::Append(RAMNTupleRecord::MakeModel(), "RAM", *file);
+            auto entry = writer->GetModel().CreateEntry();
+            auto rec = entry->GetPtr<RAMNTupleRecord>("record");
+            *entry->GetPtr<std::string>(RAMNTupleRecord::kConsensusField) = "ACGT";
+            if (i == 0)
+               *entry->GetPtr<std::vector<std::uint32_t>>(RAMNTupleRecord::kConsensusPatchField) = {(4U << 8) | 'A'};
+            rec->SetCompressionMode(rows[i].first);
+            rec->refid = 0;
+            rec->pos = 0;
+            rec->SetCIGAR(rows[i].second);
+            rec->seq_lit = rows[i].first & RAMNTupleRecord::kSeqConsensus ? "" : "ACGT";
+            writer->Fill(*entry);
+            meta.block_ends = {0};
+         }
+         RAMNTupleRecord::WriteMetadata(*file, meta);
+         file->Close();
+      }
+      auto file = RAMFile::Open(kFile);
+      ASSERT_NE(file, nullptr);
+      auto view = file->GetReader().GetView<RAMNTupleRecord>("record");
+      SeqBlockReader seqs(*file);
+      RAMNTupleRecord rec = view(0);
+      EXPECT_THROW(seqs.Get(rec, 0), std::runtime_error);
+   }
 }
 
 } // namespace

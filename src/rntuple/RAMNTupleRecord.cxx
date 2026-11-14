@@ -297,6 +297,7 @@ std::unique_ptr<RNTupleModel> RAMNTupleRecord::MakeModel()
    model->MakeField<std::vector<std::uint8_t>>(kNameBlockField);
    model->MakeField<std::string>(kConsensusField);
    model->MakeField<std::int32_t>(kConsensusPosField);
+   model->MakeField<std::vector<std::uint32_t>>(kConsensusPatchField);
 
    return model;
 }

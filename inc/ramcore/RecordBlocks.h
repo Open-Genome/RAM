@@ -7,7 +7,10 @@
 // htscodecs' rANS Nx16 as CRAM 3.1 compresses its quality series, or with
 // fqzcomp when asked for. It also carries the consensus of the block's aligned
 // bases, which the SEQ of its aligned reads is coded against, as CRAM's
-// embed_ref=2 slices are. METADATA lists the row each block ends on.
+// embed_ref=2 slices are, and the bases where the reference its reads' MD tags
+// give differs from the consensus. Against that reference MD and NM are
+// rebuilt, so a read whose tags come back exactly stores neither. METADATA lists
+// the row each block ends on.
 
 #include "rntuple/RAMFile.h"
 #include "rntuple/RAMNTupleRecord.h"
@@ -100,6 +103,9 @@ private:
       std::vector<std::array<std::uint32_t, 5>> counts; ///< A, C, G, T and others per consensus base.
       std::string consensus;
       std::int32_t consensusPos = 0;
+      std::string reference;            ///< The consensus with the bases the reads' MD tags give.
+      std::vector<std::uint32_t> patch; ///< Where reference differs from consensus, as kConsensusPatchField.
+      std::string md;                   ///< A rebuilt MD, reused between records.
       std::vector<std::uint8_t> qualBlob;
       std::vector<std::uint8_t> nameBlob;
    };
@@ -107,7 +113,8 @@ private:
    /// Fills the previous block and encodes this one.
    void EndBlock();
    static void Encode(Block &b);
-   /// Sets the records' stored SEQ and the block's consensus.
+   /// Sets the records' stored SEQ, the block's consensus and its patches, and
+   /// leaves out the MD and NM that can be rebuilt.
    static void CodeSequences(Block &b);
    /// Fills the rows of an encoded block, in order, and empties it.
    void Fill(Block &b);
@@ -118,6 +125,7 @@ private:
    std::vector<std::uint8_t> *m_nameBlob = nullptr;
    std::string *m_consensus = nullptr;
    std::int32_t *m_consensusPos = nullptr;
+   std::vector<std::uint32_t> *m_patch = nullptr;
    FillFn m_fill;
    std::size_t m_blockRecords;
    std::size_t m_blockBases;
@@ -199,13 +207,15 @@ private:
 };
 
 /// Returns SEQ, rebuilding the bases its record codes against its block's
-/// consensus.
+/// consensus, and rebuilds the record's MD and NM against the block's reference.
 class SeqBlockReader {
 public:
    explicit SeqBlockReader(RAMFile &file);
 
-   /// Valid until the next call.
-   std::string_view Get(const RAMNTupleRecord &rec, ROOT::NTupleSize_t row);
+   /// Valid until the next call. Fills the MD and NM of \p rec that the file
+   /// left out and clears kMdRebuilt and kNmRebuilt, so call it before
+   /// RAMFile::AppendTags().
+   std::string_view Get(RAMNTupleRecord &rec, ROOT::NTupleSize_t row);
 
 private:
    static constexpr std::size_t kNoBlock = static_cast<std::size_t>(-1);
@@ -223,13 +233,17 @@ private:
 
    ROOT::RNTupleView<std::string> m_consensusView;
    ROOT::RNTupleView<std::int32_t> m_posView;
+   ROOT::RNTupleView<std::vector<std::uint32_t>> m_patchView;
    std::vector<uint64_t> m_ends; ///< Last row of each block.
    std::size_t m_block = kNoBlock;
    uint64_t m_firstRow = 0;
    std::string m_consensus;
+   std::string m_reference;              ///< m_consensus with the block's patches.
+   std::vector<std::uint32_t> m_patches; ///< The block's patches, ascending.
    std::int32_t m_pos = 0;
    std::vector<Piece> m_pieces;
    std::string m_seq;
+   std::string m_md; ///< A rebuilt MD the record does not keep, when only NM is rebuilt.
 };
 
 #endif // RAMCORE_RECORDBLOCKS_H

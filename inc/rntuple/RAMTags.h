@@ -72,6 +72,7 @@ public:
    explicit RAMTagReader(const RAMFileMetadata &meta);
 
    /// Appends \p rec's tags to \p out, each after a tab, in input order.
+   /// Throws std::logic_error for a record whose MD or NM is still to rebuild.
    void Append(const RAMNTupleRecord &rec, std::string &out) const;
 
 private:

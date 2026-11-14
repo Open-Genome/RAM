@@ -90,7 +90,7 @@ Dump ReadBack(const char *file)
    NameBlockReader names(*ram);
    SeqBlockReader seqs(*ram);
    for (auto i : reader.GetEntryRange()) {
-      const RAMNTupleRecord &r = view(i);
+      RAMNTupleRecord r = view(i);
       const bool sameRef = ram->MateOnSameRef(r);
       std::string line = std::string(names.Get(i)) + "\t" + std::to_string(r.GetFLAG()) + "\t" +
                          ram->GetRname(r.GetREFID()) + "\t" + std::to_string(r.GetPOS()) + "\t" +

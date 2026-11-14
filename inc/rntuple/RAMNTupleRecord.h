@@ -164,7 +164,9 @@ public:
       kQualInBlock = 1 << 18,     // QUAL is in its block, not in `qual`
       kFqzcomp = 1 << 19,         // In a quality policy: compress the quality blocks
                                   // with fqzcomp, not rANS (-fqzcomp); not kept in records
-      kSeqConsensus = 1 << 20     // SEQ is coded against its block's consensus, not all in seq_lit
+      kSeqConsensus = 1 << 20,    // SEQ is coded against its block's consensus, not all in seq_lit
+      kMdRebuilt = 1 << 21,       // tag_md is left empty: readers rebuild MD against the block's reference
+      kNmRebuilt = 1 << 22        // tag_nm is left 0: readers rebuild NM against the block's reference
    };
 
    static constexpr const char *kQualBlockField = "qualblock";
@@ -173,10 +175,15 @@ public:
    /// first base, carried by the block's last row; see ramcore/RecordBlocks.h.
    static constexpr const char *kConsensusField = "consensus";
    static constexpr const char *kConsensusPosField = "consensus_pos";
+   /// The block's reference: where its reads' MD tags give a base other than
+   /// the consensus's, the base's offset in the consensus shifted left 8 bits,
+   /// ORed with the base. MD and NM are rebuilt against it, as a CRAM slice
+   /// rebuilds them against its embedded reference.
+   static constexpr const char *kConsensusPatchField = "consensus_patch";
 
    /// Version of the file layout, stored in METADATA. Until 1.0 a reader opens
    /// only files of its own version; bump it with every change to the layout.
-   static constexpr uint32_t kFormatVersion = 9;
+   static constexpr uint32_t kFormatVersion = 10;
 
    // Alignment data fields
    std::string qname;             //! Query template NAME; not a column: the names are in kNameBlockField
@@ -202,6 +209,7 @@ public:
 
    // Standard tags in columns of their own; RAMTagWriter fills them and
    // RAMTagReader writes them back. tag_order says which the record has.
+   // With kMdRebuilt or kNmRebuilt, SeqBlockReader::Get() fills tag_md or tag_nm.
    int32_t tag_nm = 0;
    int32_t tag_as = 0;
    int32_t tag_xs = 0;

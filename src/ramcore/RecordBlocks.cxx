@@ -306,6 +306,174 @@ bool CodeAgainst(RAMNTupleRecord &rec, std::string_view consensus, std::int64_t 
    return true;
 }
 
+// A patch holds its base in the low bits and its offset in the consensus above them.
+constexpr unsigned kPatchBaseBits = 8;
+
+bool IsDigit(char c)
+{
+   return c >= '0' && c <= '9';
+}
+
+bool IsLetter(char c)
+{
+   return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+}
+
+char Upper(char c)
+{
+   return c >= 'a' && c <= 'z' ? static_cast<char>(c - 'a' + 'A') : c;
+}
+
+// Writes into \p ref, which starts at \p lo, the reference bases that the MD of
+// \p rec, which Codable() accepted inside \p ref, gives at its mismatches and
+// deletions. Stops where MD and the CIGAR disagree: the MD rebuilt against
+// \p ref then differs from the record's, which keeps it.
+void LearnReference(const RAMNTupleRecord &rec, std::string &ref, std::int64_t lo)
+{
+   const char *md = rec.tag_md.c_str();
+   auto at = static_cast<std::size_t>(rec.pos - lo);
+   std::size_t matches = 0; // Matching bases MD has given and the CIGAR has not yet used.
+   const auto number = [&md, &matches] {
+      constexpr std::size_t kMaxMatches = std::size_t{1} << 40;
+      while (matches == 0 && IsDigit(*md)) {
+         for (; IsDigit(*md) && matches < kMaxMatches; md++)
+            matches = matches * 10 + static_cast<std::size_t>(*md - '0');
+      }
+   };
+   for (const uint32_t op : rec.cigar) {
+      const int type = CigarType(op);
+      std::size_t n = op >> 4;
+      if (type == kReadAndRef) {
+         while (n > 0) {
+            number();
+            if (matches == 0) {
+               if (!IsLetter(*md))
+                  return;
+               ref[at++] = Upper(*md++);
+               n--;
+               continue;
+            }
+            const std::size_t k = std::min(n, matches);
+            matches -= k;
+            at += k;
+            n -= k;
+         }
+      } else if ((op & 0xF) == RAM_CIGAR_D) {
+         number();
+         if (matches != 0 || *md != '^')
+            return;
+         md++;
+         for (std::size_t k = 0; k < n; k++) {
+            if (!IsLetter(*md))
+               return;
+            ref[at + k] = Upper(*md++);
+         }
+         at += n;
+      } else if (type & kRef) {
+         at += n;
+      }
+   }
+}
+
+// The MD and NM of a read at \p pos with \p cigar and \p seq against \p ref,
+// which starts at \p lo, in the form samtools calmd writes them: a read base
+// matches the same base, unless it is N. \p ref is the block's consensus with
+// \p patches, ascending; \p diffs are the read's differences from the
+// consensus, as seq_diff codes them. A read with no N can then mismatch only at
+// a difference or a patch, so only those are compared. False when the read
+// runs outside \p ref.
+bool MakeMdNm(const std::vector<uint32_t> &cigar, std::string_view seq, const std::vector<uint32_t> &diffs,
+              std::int64_t pos, std::string_view ref, std::int64_t lo, const std::vector<std::uint32_t> &patches,
+              std::string &md, std::int64_t &nm)
+{
+   md.clear();
+   nm = 0;
+   std::size_t matches = 0;
+   // Digit by digit: appending a run of digits costs a call for every read.
+   const auto number = [&md, &matches] {
+      std::array<char, 20> digits{};
+      std::size_t i = 0;
+      do {
+         digits[i++] = static_cast<char>('0' + matches % 10);
+         matches /= 10;
+      } while (matches > 0);
+      while (i > 0)
+         md.push_back(digits[--i]);
+   };
+   if (pos < lo)
+      return false;
+   auto at = static_cast<std::size_t>(pos - lo);
+   std::size_t q = 0;
+   const bool seqHasN = seq.find('N') != std::string_view::npos;
+   constexpr std::size_t kNone = std::numeric_limits<std::size_t>::max();
+   std::size_t diff = 0;
+   std::size_t diffPos = diffs.empty() ? 0 : diffs[0] >> kDiffCodeBits;
+   const auto nextDiff = [&] {
+      if (++diff < diffs.size())
+         diffPos += diffs[diff] >> kDiffCodeBits;
+   };
+   const auto offset = [](std::uint32_t p) { return static_cast<std::size_t>(p >> kPatchBaseBits); };
+   auto patch = std::partition_point(patches.begin(), patches.end(), [&](std::uint32_t p) { return offset(p) < at; });
+   for (const uint32_t op : cigar) {
+      const int type = CigarType(op);
+      const std::size_t n = op >> 4;
+      if ((type & kRef) && (op & 0xF) != RAM_CIGAR_N && (at > ref.size() || n > ref.size() - at))
+         return false;
+      if ((type & kRead) && (q > seq.size() || n > seq.size() - q))
+         return false;
+      if (type == kReadAndRef) {
+         std::size_t from = at; // Reference bases before it are accounted for.
+         const auto compare = [&](std::size_t c) {
+            const char base = ref[c];
+            if (seq[q + c - at] == base && base != 'N')
+               return;
+            matches += c - from;
+            number();
+            md += base;
+            nm++;
+            from = c + 1;
+         };
+         if (seqHasN) {
+            for (std::size_t c = at; c < at + n; c++)
+               compare(c);
+         } else {
+            while (true) {
+               while (diff < diffs.size() && diffPos < q)
+                  nextDiff();
+               const std::size_t d = diff < diffs.size() && diffPos < q + n ? at + (diffPos - q) : kNone;
+               const std::size_t p = patch != patches.end() && offset(*patch) < at + n ? offset(*patch) : kNone;
+               const std::size_t c = std::min(d, p);
+               if (c == kNone)
+                  break;
+               if (c == d)
+                  nextDiff();
+               if (c == p)
+                  ++patch;
+               if (c >= from)
+                  compare(c);
+            }
+         }
+         matches += at + n - from;
+      } else if ((op & 0xF) == RAM_CIGAR_D) {
+         number();
+         md += '^';
+         md.append(ref.data() + at, n);
+         nm += static_cast<std::int64_t>(n);
+      } else if ((op & 0xF) == RAM_CIGAR_I) {
+         nm += static_cast<std::int64_t>(n);
+      }
+      if (type & kRead)
+         q += n;
+      if (type & kRef)
+         at += n;
+      // Patches under deletions and skips are no mismatches.
+      while (patch != patches.end() && offset(*patch) < at)
+         ++patch;
+   }
+   number();
+   return true;
+}
+
 } // namespace
 
 BlockWriter::BlockWriter(std::unique_ptr<ROOT::REntry> entry, FillFn fill, std::size_t block_records,
@@ -316,6 +484,7 @@ BlockWriter::BlockWriter(std::unique_ptr<ROOT::REntry> entry, FillFn fill, std::
      m_nameBlob(m_entry->GetPtr<std::vector<std::uint8_t>>(RAMNTupleRecord::kNameBlockField).get()),
      m_consensus(m_entry->GetPtr<std::string>(RAMNTupleRecord::kConsensusField).get()),
      m_consensusPos(m_entry->GetPtr<std::int32_t>(RAMNTupleRecord::kConsensusPosField).get()),
+     m_patch(m_entry->GetPtr<std::vector<std::uint32_t>>(RAMNTupleRecord::kConsensusPatchField).get()),
      m_fill(std::move(fill)),
      m_blockRecords(std::max<std::size_t>(block_records, 1)),
      m_blockBases(block_bases),
@@ -444,12 +613,14 @@ void BlockWriter::Fill(Block &b)
    m_nameBlob->swap(b.nameBlob);
    m_consensus->swap(b.consensus);
    *m_consensusPos = b.consensusPos;
+   m_patch->swap(b.patch);
    m_entry->BindRawPtr<void>(m_recordToken, &b.records[b.rows - 1]);
    m_fill(*m_entry);
    m_qualBlob->clear();
    m_nameBlob->clear();
    m_consensus->clear();
    *m_consensusPos = 0;
+   m_patch->clear();
 
    m_rowsSinceTake += b.rows;
    m_blockEnds.push_back(m_rowsSinceTake - 1);
@@ -538,7 +709,8 @@ void BlockWriter::CodeSequences(Block &b)
       RAMNTupleRecord &rec = b.records[i];
       rec.seq_lit.clear();
       rec.seq_diff.clear();
-      rec.compression_flags &= ~static_cast<uint32_t>(RAMNTupleRecord::kSeqConsensus);
+      rec.compression_flags &= ~static_cast<uint32_t>(RAMNTupleRecord::kSeqConsensus | RAMNTupleRecord::kMdRebuilt |
+                                                      RAMNTupleRecord::kNmRebuilt);
       if (ends[i] >= 0 && CodeAgainst(rec, consensus, lo)) {
          rec.SetBit(RAMNTupleRecord::kSeqConsensus);
       } else {
@@ -547,6 +719,38 @@ void BlockWriter::CodeSequences(Block &b)
       }
    }
    b.consensusPos = refid < 0 ? 0 : static_cast<std::int32_t>(lo);
+
+   // The reference: the consensus, with the bases the MD tags give at their
+   // mismatches and deletions. A read whose MD or NM comes back exactly from it
+   // leaves the tag out, as a CRAM leaves out what its reference gives back.
+   b.patch.clear();
+   if (refid < 0)
+      return;
+   std::string &ref = b.reference;
+   ref = consensus;
+   for (std::size_t i = 0; i < b.rows; i++) {
+      if (ends[i] >= 0 && !b.records[i].tag_md.empty())
+         LearnReference(b.records[i], ref, lo);
+   }
+   for (std::size_t k = 0; k < ref.size(); k++) {
+      if (ref[k] != consensus[k])
+         b.patch.push_back(static_cast<std::uint32_t>(k << kPatchBaseBits) | static_cast<unsigned char>(ref[k]));
+   }
+   for (std::size_t i = 0; i < b.rows; i++) {
+      RAMNTupleRecord &rec = b.records[i];
+      std::int64_t nm = 0;
+      if (!rec.TestBit(RAMNTupleRecord::kSeqConsensus) || rec.tag_md.empty() ||
+          !MakeMdNm(rec.cigar, rec.seq, rec.seq_diff, rec.pos, ref, lo, b.patch, b.md, nm))
+         continue;
+      if (b.md == rec.tag_md) {
+         rec.SetBit(RAMNTupleRecord::kMdRebuilt);
+         rec.tag_md.clear();
+      }
+      if (nm == rec.tag_nm) {
+         rec.SetBit(RAMNTupleRecord::kNmRebuilt);
+         rec.tag_nm = 0;
+      }
+   }
 }
 
 std::vector<uint64_t> BlockWriter::TakeBlockEnds()
@@ -729,15 +933,20 @@ void NameBlockReader::Load(std::size_t block)
 SeqBlockReader::SeqBlockReader(RAMFile &file)
    : m_consensusView(file.GetReader().GetView<std::string>(RAMNTupleRecord::kConsensusField)),
      m_posView(file.GetReader().GetView<std::int32_t>(RAMNTupleRecord::kConsensusPosField)),
+     m_patchView(file.GetReader().GetView<std::vector<std::uint32_t>>(RAMNTupleRecord::kConsensusPatchField)),
      m_ends(file.GetMetadata().block_ends)
 {
    CheckBlockEnds(m_ends, file.GetReader().GetNEntries());
 }
 
-std::string_view SeqBlockReader::Get(const RAMNTupleRecord &rec, ROOT::NTupleSize_t row)
+std::string_view SeqBlockReader::Get(RAMNTupleRecord &rec, ROOT::NTupleSize_t row)
 {
-   if (!rec.TestBit(RAMNTupleRecord::kSeqConsensus))
+   constexpr uint32_t kRebuilt = RAMNTupleRecord::kMdRebuilt | RAMNTupleRecord::kNmRebuilt;
+   if (!rec.TestBit(RAMNTupleRecord::kSeqConsensus)) {
+      if (rec.TestBit(kRebuilt))
+         throw std::runtime_error("record " + std::to_string(row) + " has MD or NM to rebuild but no consensus");
       return rec.seq_lit;
+   }
    if (m_block == kNoBlock || row < m_firstRow || row > m_ends[m_block]) {
       const auto it = std::lower_bound(m_ends.begin(), m_ends.end(), static_cast<uint64_t>(row));
       if (it == m_ends.end())
@@ -746,8 +955,26 @@ std::string_view SeqBlockReader::Get(const RAMNTupleRecord &rec, ROOT::NTupleSiz
       m_firstRow = m_block == 0 ? 0 : m_ends[m_block - 1] + 1;
       m_consensus = m_consensusView(*it);
       m_pos = m_posView(*it);
+      m_reference = m_consensus;
+      m_patches = m_patchView(*it);
+      for (std::size_t i = 0; i < m_patches.size(); i++) {
+         const std::size_t at = m_patches[i] >> kPatchBaseBits;
+         if (at >= m_reference.size() || (i > 0 && at <= (m_patches[i - 1] >> kPatchBaseBits)))
+            throw std::runtime_error("the reference of block " + std::to_string(m_block) + " is damaged");
+         m_reference[at] = static_cast<char>(m_patches[i] & ((1U << kPatchBaseBits) - 1));
+      }
    }
    Decode(rec, row);
+   if (rec.TestBit(kRebuilt)) {
+      std::int64_t nm = 0;
+      std::string &md = rec.TestBit(RAMNTupleRecord::kMdRebuilt) ? rec.tag_md : m_md;
+      if (!MakeMdNm(rec.cigar, m_seq, rec.seq_diff, rec.pos, m_reference, m_pos, m_patches, md, nm) ||
+          nm > std::numeric_limits<std::int32_t>::max())
+         throw std::runtime_error("the MD and NM of record " + std::to_string(row) + " are damaged");
+      if (rec.TestBit(RAMNTupleRecord::kNmRebuilt))
+         rec.tag_nm = static_cast<std::int32_t>(nm);
+      rec.compression_flags &= ~kRebuilt;
+   }
    return m_seq;
 }
 

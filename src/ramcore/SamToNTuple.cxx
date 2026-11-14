@@ -592,6 +592,7 @@ bool samtoramntuple(const char *datafile, const char *treefile, int compression_
    model->MakeField<std::vector<std::uint8_t>>(RAMNTupleRecord::kNameBlockField);
    model->MakeField<std::string>(RAMNTupleRecord::kConsensusField);
    model->MakeField<std::int32_t>(RAMNTupleRecord::kConsensusPosField);
+   model->MakeField<std::vector<std::uint32_t>>(RAMNTupleRecord::kConsensusPatchField);
 
    ROOT::RNTupleWriteOptions writeOptions;
    writeOptions.SetCompression(compression_algorithm);

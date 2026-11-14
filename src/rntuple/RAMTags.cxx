@@ -9,6 +9,7 @@
 #include <initializer_list>
 #include <limits>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -176,6 +177,8 @@ RAMTagReader::RAMTagReader(const RAMFileMetadata &meta) : m_rg(meta.tag_rg), m_p
 
 void RAMTagReader::Append(const RAMNTupleRecord &rec, std::string &out) const
 {
+   if (rec.TestBit(RAMNTupleRecord::kMdRebuilt | RAMNTupleRecord::kNmRebuilt))
+      throw std::logic_error("a record's MD and NM are written back before SeqBlockReader::Get() rebuilt them");
    std::size_t text = 0;
    if (rec.tag_order < m_orders.size()) {
       for (const int8_t i : m_orders[rec.tag_order]) {
