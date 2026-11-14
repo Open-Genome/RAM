@@ -18,7 +18,6 @@ The tools:
 | `ramdump` | writes a RAM file, or a region of it, out as SAM; takes the `samtools view` options |
 | `ramntupleview` | counts the records in a region and reports the query time |
 | `ramstats` | `idxstats` and `flagstat`, printed as `samtools idxstats` and `samtools flagstat` print them, and `size`, the bytes each field takes |
-| `libram/ramread` | writes a RAM file, or a region of it, as SAM or BAM without ROOT; with a small htslib patch samtools reads RAM files too, see [libram/README.md](libram/README.md) |
 
 ## Installation
 

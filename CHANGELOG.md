@@ -48,13 +48,13 @@ the README for what that means before 1.0.
   reads' MD tags give where they differ from its consensus (`consensus_patch`,
   about 35 a block of short reads), and a read leaves out MD or NM when the one
   computed against that reference is the same; any other is stored as before.
-  `ramdump`, `libram` and the samtools patch compute them again. On 5 Mb of
-  chr20, HG00154 Illumina reads go from 75.9 to 70.9 MB, their tags from 39.1
-  to 34.1 MB against 33.9 MB in CRAM 3.1 with `embed_ref=2`; HG002 Revio reads,
-  which have neither tag, stay at 44.8 MB. Conversion takes no longer: best of
-  eight alternating runs on the Illumina slice, 2% less from BAM and from SAM
-  at `-threads 4` and 0.6% less at one thread, with 1.4% fewer instructions. A
-  full dump of the Illumina reads takes 2 to 3% longer; regions print as fast.
+  `ramdump` computes them again. On 5 Mb of chr20, HG00154 Illumina reads go
+  from 75.9 to 70.9 MB, their tags from 39.1 to 34.1 MB against 33.9 MB in
+  CRAM 3.1 with `embed_ref=2`; HG002 Revio reads, which have neither tag, stay
+  at 44.8 MB. Conversion takes no longer: best of eight alternating runs on the
+  Illumina slice, 2% less from BAM and from SAM at `-threads 4` and 0.6% less
+  at one thread, with 1.4% fewer instructions. A full dump of the Illumina
+  reads takes 2 to 3% longer; regions print as fast.
   The format version becomes 10, and files written before must be converted
   again.
 - `bamtoramntuple` copies each record's CIGAR from BAM and decodes SEQ two
@@ -76,11 +76,10 @@ the README for what that means before 1.0.
   Revio.
   The format version becomes 9, and files written before must be converted
   again.
-- `ramdump` and `libram` rebuild consensus-coded SEQ with one copy for each
-  run of `M`, `=` and `X` operations and a table for substitutions, instead of
-  working through a HiFi read's 2,000 or so CIGAR operations one at a time.
-  Printing 1 Mb of the Revio reads takes 0.743 s instead of 0.762 s, and
-  `ramread` of the whole Revio file 2.02 s instead of 2.30 s.
+- `ramdump` rebuilds consensus-coded SEQ with one copy for each run of `M`,
+  `=` and `X` operations and a table for substitutions, instead of working
+  through a HiFi read's 2,000 or so CIGAR operations one at a time.
+  Printing 1 Mb of the Revio reads takes 0.743 s instead of 0.762 s.
 - The converters write RNTuple's default pages of up to 1 MiB instead of
   64 KB, so ZSTD sees more than four long reads at a time. On 5 Mb of chr20
   converted from SAM, HG002 PacBio Revio reads go from 64.4 to 46.5 MB (28%
