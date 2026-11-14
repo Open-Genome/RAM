@@ -205,6 +205,26 @@ constexpr std::array<std::uint8_t, 256> kCountSlot = [] {
    return t;
 }();
 
+// The base each seq_diff code gives in place of each byte of the consensus, or
+// '\0' where it gives none: a table, since a long read has thousands of
+// differences to apply.
+constexpr std::array<std::array<char, 256>, std::size_t{1} << kDiffCodeBits> kSubstitute = [] {
+   std::array<std::array<char, 256>, std::size_t{1} << kDiffCodeBits> t{};
+   for (std::size_t code = 0; code < static_cast<std::size_t>(kSubOther); code++) {
+      for (std::size_t cons = 0; cons < kAcgt.size(); cons++)
+         t[code][static_cast<unsigned char>(kAcgt[cons])] = kAcgt[(cons + code + 1) % 4];
+   }
+   for (std::size_t i = 0; i < kBases.size(); i++) {
+      for (auto &base : t[static_cast<std::size_t>(kSubOther) + i])
+         base = kBases[i];
+   }
+   return t;
+}();
+
+// The operations CigarType() calls kReadAndRef, a bit each: a test of one is
+// cheaper than its switch, in a loop over thousands of them a long read.
+constexpr uint32_t kReadAndRefOps = (1U << RAM_CIGAR_M) | (1U << RAM_CIGAR_EQUAL) | (1U << RAM_CIGAR_X);
+
 int Acgt(char base)
 {
    return kAcgtIndex[static_cast<unsigned char>(base)];
@@ -736,41 +756,40 @@ void SeqBlockReader::Decode(const RAMNTupleRecord &rec, ROOT::NTupleSize_t row)
    const auto damaged = [row] {
       return std::runtime_error("the SEQ of record " + std::to_string(row) + " is damaged");
    };
-   // One pass over the CIGAR finds where each stretch of SEQ comes from. Long
-   // reads have hundreds of =, X and M operations in a row, which read
-   // consecutive consensus bases and make one stretch.
+   // One pass over the CIGAR finds where each stretch of SEQ comes from.
    m_pieces.clear();
    std::size_t q = 0;
    std::size_t lit = 0;
    std::int64_t at = static_cast<std::int64_t>(rec.pos) - m_pos;
-   bool inRun = false;
-   for (const uint32_t op : rec.cigar) {
-      const int type = CigarType(op);
-      const std::size_t n = op >> 4;
+   const std::vector<uint32_t> &cigar = rec.cigar;
+   for (std::size_t i = 0; i < cigar.size();) {
+      const int type = CigarType(cigar[i]);
       if (type < 0)
          throw damaged();
       if (type == kReadAndRef) {
-         if (inRun) {
-            m_pieces.back().length += n;
-         } else {
-            if (at < 0)
-               throw damaged();
-            m_pieces.push_back({q, static_cast<std::size_t>(at), n, false});
-            inRun = true;
-         }
-      } else if (type != 0) {
-         inRun = false;
-         if (type & kRead) {
-            if (n > rec.seq_lit.size() - lit)
-               throw damaged();
-            m_pieces.push_back({q, lit, n, true});
-            lit += n;
-         }
-      }
-      if (type & kRead)
+         // Long reads have hundreds of =, X and M operations in a row, which
+         // read consecutive consensus bases and make one stretch.
+         std::size_t n = 0;
+         for (; i < cigar.size() && ((kReadAndRefOps >> (cigar[i] & 0xF)) & 1U) != 0; i++)
+            n += cigar[i] >> 4;
+         if (at < 0)
+            throw damaged();
+         m_pieces.push_back({q, static_cast<std::size_t>(at), n, false});
          q += n;
+         at += static_cast<std::int64_t>(n);
+         continue;
+      }
+      const std::size_t n = cigar[i] >> 4;
+      if (type & kRead) {
+         if (n > rec.seq_lit.size() - lit)
+            throw damaged();
+         m_pieces.push_back({q, lit, n, true});
+         lit += n;
+         q += n;
+      }
       if (type & kRef)
          at += static_cast<std::int64_t>(n);
+      i++;
    }
    if (lit != rec.seq_lit.size())
       throw damaged();
@@ -787,16 +806,9 @@ void SeqBlockReader::Decode(const RAMNTupleRecord &rec, ROOT::NTupleSize_t row)
       pos += diff >> kDiffCodeBits;
       if (pos >= m_seq.size())
          throw damaged();
-      const auto code = static_cast<int>(diff & ((1U << kDiffCodeBits) - 1));
-      if (code < kSubOther) {
-         const int cons = Acgt(m_seq[pos]);
-         if (cons < 0)
-            throw damaged();
-         m_seq[pos] = kAcgt[static_cast<std::size_t>((cons + code + 1) % 4)];
-      } else if (static_cast<std::size_t>(code - kSubOther) < kBases.size()) {
-         m_seq[pos] = kBases[static_cast<std::size_t>(code - kSubOther)];
-      } else {
+      const char base = kSubstitute[diff & ((1U << kDiffCodeBits) - 1)][static_cast<unsigned char>(m_seq[pos])];
+      if (base == '\0')
          throw damaged();
-      }
+      m_seq[pos] = base;
    }
 }

@@ -58,6 +58,11 @@ the README for what that means before 1.0.
   Revio.
   The format version becomes 9, and files written before must be converted
   again.
+- `ramdump` and `libram` rebuild consensus-coded SEQ with one copy for each
+  run of `M`, `=` and `X` operations and a table for substitutions, instead of
+  working through a HiFi read's 2,000 or so CIGAR operations one at a time.
+  Printing 1 Mb of the Revio reads takes 0.743 s instead of 0.762 s, and
+  `ramread` of the whole Revio file 2.02 s instead of 2.30 s.
 - The converters write RNTuple's default pages of up to 1 MiB instead of
   64 KB, so ZSTD sees more than four long reads at a time. On 5 Mb of chr20
   converted from SAM, HG002 PacBio Revio reads go from 64.4 to 46.5 MB (28%

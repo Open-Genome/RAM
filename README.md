@@ -301,7 +301,7 @@ runs, warm cache, in seconds; all three formats return the same records.
 | Illumina, 1 Mb | 726,726 | 0.840 | 0.698 | 0.114 | 1.700 | 3.050 | 1.983 |
 | Revio, 100 bp | 20 | 0.012 | 0.017 | 0.041 | 0.012 | 0.042 | 0.107 |
 | Revio, 85 kb | 180 | 0.022 | 0.022 | 0.041 | 0.024 | 0.070 | 0.110 |
-| Revio, 1 Mb | 6,018 | 0.447 | 0.526 | 0.043 | 0.614 | 1.254 | 0.762 |
+| Revio, 1 Mb | 6,018 | 0.447 | 0.526 | 0.043 | 0.614 | 1.254 | 0.743 |
 
 A RAM count reads only the position and CIGAR columns, so it stays fast as the
 region grows. Printing a small region is slower than samtools: RAM decodes a
