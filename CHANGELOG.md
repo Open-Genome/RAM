@@ -43,6 +43,20 @@ the README for what that means before 1.0.
 
 ### Changed
 
+- MD and NM are no longer stored when they can be computed again, as a CRAM
+  computes them from its reference. A block also keeps the reference bases its
+  reads' MD tags give where they differ from its consensus (`consensus_patch`,
+  about 35 a block of short reads), and a read leaves out MD or NM when the one
+  computed against that reference is the same; any other is stored as before.
+  `ramdump`, `libram` and the samtools patch compute them again. On 5 Mb of
+  chr20, HG00154 Illumina reads go from 75.9 to 70.9 MB, their tags from 39.1
+  to 34.1 MB against 33.9 MB in CRAM 3.1 with `embed_ref=2`; HG002 Revio reads,
+  which have neither tag, stay at 44.8 MB. Conversion takes no longer: best of
+  eight alternating runs on the Illumina slice, 2% less from BAM and from SAM
+  at `-threads 4` and 0.6% less at one thread, with 1.4% fewer instructions. A
+  full dump of the Illumina reads takes 2 to 3% longer; regions print as fast.
+  The format version becomes 10, and files written before must be converted
+  again.
 - `bamtoramntuple` copies each record's CIGAR from BAM and decodes SEQ two
   bases a byte, instead of writing both as SAM text and parsing them back.
   Conversion of the 5 Mb chr20 slices is 4 to 10% faster at 1 and 4 threads,

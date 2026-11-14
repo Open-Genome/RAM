@@ -209,7 +209,9 @@ time for any file. `nameblock` and `qualblock` hold the read names and the
 lossless qualities, already coded with tok3 and rANS (or fqzcomp) before
 ROOT compresses them. SEQ is `consensus`, a block's consensus of its aligned
 reads, with `record.seq_diff` and `record.seq_lit`, each read's substitutions
-against it and its other bases.
+against it and its other bases. `consensus_patch` holds the reference bases MD
+and NM are computed again from; a read's `record.tag_md` and `record.tag_nm`
+are empty when they are.
 
 ## Checking a RAM file against samtools
 
@@ -254,8 +256,8 @@ chr20 of NA12878 on your own machine.
 | BAM | 152.4 MB | 101.2 MB |
 | CRAM 3.1 with the reference | 67.9 MB | 70.1 MB |
 | CRAM 3.1, `embed_ref=2` | 69.1 MB | 41.9 MB |
-| RAM | 75.9 MB | 44.8 MB |
-| RAM, `-compression 509` | 70.8 MB | 43.1 MB |
+| RAM | 70.9 MB | 44.8 MB |
+| RAM, `-compression 509` | 66.1 MB | 43.1 MB |
 
 RAM gives both inputs back byte for byte (`ramdump -h` against
 `samtools view -h`). Both CRAMs give the Illumina reads back exactly, but the
@@ -271,19 +273,20 @@ holds both.
 
 | | Illumina RAM | Illumina CRAM | Revio RAM | Revio CRAM |
 |---|---:|---:|---:|---:|
-| SEQ | 10.02 | 10.90 | 7.28 | 10.60 |
+| SEQ | 10.01 | 10.90 | 7.28 | 10.60 |
 | CIGAR | 2.14 | | 5.66 | |
 | QUAL | 11.05 | 11.07 | 24.54 | 24.51 |
 | NAME | 7.38 | 7.38 | 0.05 | 0.06 |
-| AUX (tags) | 39.06 | 33.94 | 7.20 | 6.52 |
+| AUX (tags) | 34.06 | 33.94 | 7.20 | 6.52 |
 | MATE (RNEXT, PNEXT, TLEN) | 3.87 | 2.78 | 0.03 | 0.03 |
 | other (FLAG, POS, MAPQ, ...) | 2.31 | 2.71 | 0.03 | 0.06 |
 
 Names and qualities are compressed with the codecs CRAM 3.1 uses, tok3 and
 rANS order 1, in blocks the size of a CRAM slice, and come out the same size.
-On the Illumina reads 5.2 MB of the tags are MD and NM, which a CRAM does not
-store but computes again from its reference or consensus; a RAM file has
-neither and stores them. Both store the bases as differences from a consensus
+Neither stores MD and NM where it can compute them again: a CRAM from its
+reference or consensus, RAM from each block's reference (see below). On the
+Illumina reads they took 5.0 MB when RAM stored them. Both store the bases as
+differences from a consensus
 of the reads near them: RAM's SEQ row is each block's consensus, the
 substitutions against it and the soft-clipped and inserted bases. On the Revio
 reads most of the CIGAR is the `=` and `X` detail the CRAMs drop.
@@ -324,9 +327,13 @@ Reading is no slower: a full `ramdump` takes 3.7 s and 1.0 s with either.
 Records are stored in blocks of 10,000 records or 5 million bases or quality
 values, whichever comes first, as CRAM sizes its slices. A block holds the
 consensus of its aligned reads, the commonest base at each position they
-cover, and their bases are stored as differences from it. Read names and
-lossless quality scores are stored per block, with the codecs CRAM 3.1 uses by
-default:
+cover, and their bases are stored as differences from it. The block's
+reference is that consensus with the bases the reads' MD tags give where they
+differ from it, at a homozygous variant or a deletion, about 35 bases a block
+of short reads. A read's MD and NM are computed again from it, as samtools
+calmd computes them, and kept only when that gives something else. Read
+names and lossless quality scores are stored per block, with the codecs CRAM
+3.1 uses by default:
 the names with tok3, the qualities with rANS order 1. `-fqzcomp` compresses the
 quality blocks with fqzcomp instead, CRAM 3.1's codec for its smaller
 profiles. On chr20 of NA12878 at 30x, whose qualities are binned to four
