@@ -122,7 +122,7 @@ void samtoramntuple_split_by_chromosome(const char *datafile, const char *output
 
       cw.writer = ROOT::RNTupleWriter::Append(RAMNTupleRecord::MakeModel(), "RAM", *cw.file, writeOptions);
       auto *writer = cw.writer.get();
-      cw.out = std::make_unique<BlockWriter>(writer->GetModel().CreateEntry(), writer->GetModel().CreateEntry(),
+      cw.out = std::make_unique<BlockWriter>(writer->GetModel().CreateEntry(),
                                              [writer](ROOT::REntry &e) { writer->Fill(e); });
       return cw;
    };
@@ -475,7 +475,7 @@ void WorkerMain(BlockQueue &queue, Progress &progress, SharedRefs &refs,
 {
    const StopOthersOnException guard(progress, queue);
 
-   BlockWriter out(ctx->CreateEntry(), ctx->CreateEntry(), [&ctx](ROOT::REntry &e) { ctx->Fill(e); });
+   BlockWriter out(ctx->CreateEntry(), [&ctx](ROOT::REntry &e) { ctx->Fill(e); });
    RefCache rname_cache;
    RefCache rnext_cache;
    RAMTagWriter tags(refs.tags);
@@ -590,6 +590,8 @@ bool samtoramntuple(const char *datafile, const char *treefile, int compression_
    model->MakeField<RAMNTupleRecord>("record");
    model->MakeField<std::vector<std::uint8_t>>(RAMNTupleRecord::kQualBlockField);
    model->MakeField<std::vector<std::uint8_t>>(RAMNTupleRecord::kNameBlockField);
+   model->MakeField<std::string>(RAMNTupleRecord::kConsensusField);
+   model->MakeField<std::int32_t>(RAMNTupleRecord::kConsensusPosField);
 
    ROOT::RNTupleWriteOptions writeOptions;
    writeOptions.SetCompression(compression_algorithm);

@@ -9,6 +9,7 @@
 #include <ROOT/RNTupleWriteOptions.hxx>
 #include <ROOT/RNTupleWriter.hxx>
 #include <TFile.h>
+#include <TROOT.h>
 #include <TStopwatch.h>
 
 #include <htslib/hts.h>
@@ -166,8 +167,11 @@ void bamtoramntuple(const char *bamfile, const char *treefile, bool /*split*/, b
    opts.SetCompression(compression_algorithm);
 
    auto writer = ROOT::RNTupleWriter::Append(std::move(model), "RAM", *rootFile, opts);
-   BlockWriter out(writer->GetModel().CreateEntry(), writer->GetModel().CreateEntry(),
-                   [&writer](ROOT::REntry &e) { writer->Fill(e); });
+   // With -threads, ROOT compresses the pages on its pool and this thread is
+   // the bottleneck, so the blocks are coded on another.
+   BlockWriter out(
+      writer->GetModel().CreateEntry(), [&writer](ROOT::REntry &e) { writer->Fill(e); }, kBlockRecords, kBlockBases,
+      /*background=*/ROOT::IsImplicitMTEnabled());
 
    bam1_t *rec = bam_init1();
    std::size_t count = 0;

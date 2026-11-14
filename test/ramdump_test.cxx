@@ -231,7 +231,7 @@ TEST_F(RamdumpTest, SizeAddsUpToTheTotal)
    ASSERT_EQ(fields.count("total"), 1U);
    const auto total = fields.at("total");
    fields.erase("total");
-   for (const char *field : {"record.seq", "record.cigar", "record.tag_nm", "qualblock", "nameblock"})
+   for (const char *field : {"record.seq_lit", "record.cigar", "record.tag_nm", "qualblock", "nameblock"})
       EXPECT_EQ(fields.count(field), 1U) << field;
    std::pair<uint64_t, uint64_t> sum{};
    for (const auto &[field, size] : fields) {

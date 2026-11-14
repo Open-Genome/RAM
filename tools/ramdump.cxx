@@ -79,7 +79,8 @@ class RecordReader {
    ROOT::RNTupleView<int32_t> m_refnext;
    ROOT::RNTupleView<int32_t> m_pnextDelta;
    ROOT::RNTupleView<int32_t> m_tlenDelta;
-   ROOT::RNTupleView<std::string> m_seq;
+   ROOT::RNTupleView<std::string> m_seqLit;
+   ROOT::RNTupleView<std::vector<uint32_t>> m_seqDiff;
    ROOT::RNTupleView<std::string> m_qual;
    ROOT::RNTupleView<int32_t> m_tagNm;
    ROOT::RNTupleView<int32_t> m_tagAs;
@@ -105,7 +106,8 @@ public:
         m_refnext(reader.GetView("record.refnext", &m_record.refnext)),
         m_pnextDelta(reader.GetView("record.pnext_delta", &m_record.pnext_delta)),
         m_tlenDelta(reader.GetView("record.tlen_delta", &m_record.tlen_delta)),
-        m_seq(reader.GetView("record.seq", &m_record.seq)),
+        m_seqLit(reader.GetView("record.seq_lit", &m_record.seq_lit)),
+        m_seqDiff(reader.GetView("record.seq_diff", &m_record.seq_diff)),
         m_qual(reader.GetView("record.qual", &m_record.qual)),
         m_tagNm(reader.GetView("record.tag_nm", &m_record.tag_nm)),
         m_tagAs(reader.GetView("record.tag_as", &m_record.tag_as)),
@@ -139,7 +141,8 @@ public:
       m_refnext(row);
       m_pnextDelta(row);
       m_tlenDelta(row);
-      m_seq(row);
+      m_seqLit(row);
+      m_seqDiff(row);
       m_qual(row);
       m_tagNm(row);
       m_tagAs(row);
@@ -158,8 +161,8 @@ public:
    }
 };
 
-void WriteRecord(const RAMFile &file, std::string_view name, const RAMNTupleRecord &rec, const std::string &qual,
-                 SamWriter &out)
+void WriteRecord(const RAMFile &file, std::string_view name, const RAMNTupleRecord &rec, std::string_view seq,
+                 const std::string &qual, SamWriter &out)
 {
    out.Str(name);
    out.Tab();
@@ -180,7 +183,7 @@ void WriteRecord(const RAMFile &file, std::string_view name, const RAMNTupleReco
    out.Tab();
    out.Int(rec.GetTLEN(sameRef));
    out.Tab();
-   out.Str(rec.GetSEQ());
+   out.Str(seq);
    out.Tab();
    out.Str(qual);
    file.AppendTags(rec, out.buf);
@@ -304,6 +307,7 @@ int main(int argc, char *argv[])
    RecordReader records(ram->GetReader());
    QualityBlockReader quals(*ram);
    NameBlockReader names(*ram);
+   SeqBlockReader seqs(*ram);
    Long64_t kept = 0;
 
    ramntuplescan(*ram, region.c_str(), [&](Long64_t row) {
@@ -312,9 +316,10 @@ int main(int argc, char *argv[])
       if ((flag & requireFlags) != requireFlags || (flag & excludeFlags))
          return;
       kept++;
-      if (!countOnly)
-         WriteRecord(*ram, names.Get(static_cast<ROOT::NTupleSize_t>(row)), rec,
-                     quals.Get(rec, static_cast<ROOT::NTupleSize_t>(row)), writer);
+      if (!countOnly) {
+         const auto r = static_cast<ROOT::NTupleSize_t>(row);
+         WriteRecord(*ram, names.Get(r), rec, seqs.Get(rec, r), quals.Get(rec, r), writer);
+      }
    });
 
    if (countOnly) {
