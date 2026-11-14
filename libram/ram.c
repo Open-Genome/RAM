@@ -26,7 +26,7 @@
 #include <string.h>
 
 enum {
-   kFormatVersion = 9
+   kFormatVersion = 10
 };
 
 /* RAMNTupleRecord's compression_flags bits. */
@@ -34,7 +34,9 @@ enum {
    kIlluminaBinning = 1 << 15,
    kDrop = 1 << 16,
    kQualInBlock = 1 << 18,
-   kSeqConsensus = 1 << 20
+   kSeqConsensus = 1 << 20,
+   kMdRebuilt = 1 << 21,
+   kNmRebuilt = 1 << 22
 };
 
 /* The first byte of a quality block: rANS or fqzcomp. */
@@ -103,15 +105,18 @@ struct RamFile {
    int sorted;
    Records r;
    Block names, quals, cons; /* cons: the consensus, whose first base cons_pos gives */
-   RntCursor cons_pos;
+   RntCursor cons_pos, patch_n, patch;
    int64_t cons_start;
    size_t cons_len;
+   Str ref;           /* the consensus with the block's patches, which MD and NM are rebuilt against */
+   uint32_t *patches; /* the block's patches, ascending */
+   size_t npatches, patches_cap;
    /* What ram_query asked for, and where reading is. */
    int query, stopped;
    int32_t qref, qstart, qend;
    uint64_t first, block_start, block, row;
    /* The record being read. */
-   Str seq, seq_lit, qual, text, tag_str[4];
+   Str seq, seq_lit, qual, text, tag_str[4], md;
    uint32_t *cigar, *diffs;
    size_t cigar_cap, diffs_cap;
    uint8_t *array, *varints;
@@ -438,12 +443,35 @@ static void load_quals(RamFile *rf, uint64_t rows)
    }
 }
 
-/* SeqBlockReader: the block's consensus and the position of its first base. */
+/* SeqBlockReader: the block's consensus, the position of its first base and its reference, the consensus with
+   the block's patches: each a consensus offset shifted left 8 bits, ORed with the base there. */
 static void load_consensus(RamFile *rf, uint64_t rows)
 {
    rf->cons_len = read_blob(rf, &rf->cons, rows);
    for (uint64_t i = 0; i < rows; ++i)
       rf->cons_start = rnt_int(&rf->cons_pos);
+   rf->ref.n = 0;
+   if (rf->cons_len > 0)
+      put(rf, &rf->ref, rf->cons.bytes, rf->cons_len);
+   rf->npatches = 0;
+   for (uint64_t i = 0; i < rows; ++i) {
+      const uint64_t n = rnt_len(&rf->patch_n);
+      if (n > (1U << 30))
+         die(rf, "block too large");
+      if (i + 1 == rows && n > rf->patches_cap) {
+         rf->patches_cap = (size_t)n;
+         rf->patches = xrealloc(rf, rf->patches, rf->patches_cap * sizeof *rf->patches);
+      }
+      for (uint64_t k = 0; k < n; ++k) {
+         const uint32_t patch = (uint32_t)rnt_int(&rf->patch);
+         if (i + 1 < rows)
+            continue;
+         if ((patch >> 8) >= rf->ref.n || (k > 0 && (patch >> 8) <= (rf->patches[k - 1] >> 8)))
+            die(rf, "the reference of a block is damaged");
+         rf->ref.s[patch >> 8] = (char)(patch & 0xff);
+         rf->patches[rf->npatches++] = patch;
+      }
+   }
    check(rf, rf->f);
 }
 
@@ -510,6 +538,103 @@ static void decode_seq(RamFile *rf, const char *name, int32_t pos, size_t ncigar
    }
    reserve(rf, s, 1);
    s->s[s->n] = '\0';
+}
+
+static void put_number(RamFile *rf, Str *s, size_t v)
+{
+   char digits[24];
+   size_t i = sizeof digits;
+   do {
+      digits[--i] = (char)('0' + v % 10);
+      v /= 10;
+   } while (v > 0);
+   put(rf, s, digits + i, sizeof digits - i);
+}
+
+/* Writes into md the MD of a record whose SEQ is rf->seq against the block's reference and returns its NM, as
+   MakeMdNm() in RecordBlocks.cxx does: a read base matches the same base, unless it is N. A read with no N can
+   mismatch only at one of its ndiffs differences from the consensus or at a patch, so only those are compared. */
+static int64_t make_md_nm(RamFile *rf, const char *name, int32_t pos, size_t ncigar, size_t ndiffs, Str *md)
+{
+   enum {
+      kDiffCodeBits = 5
+   };
+   const Str *seq = &rf->seq;
+   const char *ref = rf->ref.s;
+   size_t matches = 0, q = 0, diff = 0, patch = 0;
+   size_t diff_pos = ndiffs > 0 ? rf->diffs[0] >> kDiffCodeBits : 0;
+   int64_t nm = 0;
+   md->n = 0;
+   if ((int64_t)pos < rf->cons_start)
+      die(rf, "the MD and NM of record %s are damaged", name);
+   size_t at = (size_t)((int64_t)pos - rf->cons_start);
+   const int seq_has_n = seq->n > 0 && memchr(seq->s, 'N', seq->n) != NULL;
+   while (patch < rf->npatches && (rf->patches[patch] >> 8) < at)
+      ++patch;
+   for (size_t i = 0; i < ncigar; ++i) {
+      const int op = bam_cigar_op(rf->cigar[i]);
+      const int type = bam_cigar_type(op);
+      const size_t n = bam_cigar_oplen(rf->cigar[i]);
+      if (((type & 2) && op != BAM_CREF_SKIP && (at > rf->ref.n || n > rf->ref.n - at)) ||
+          ((type & 1) && (q > seq->n || n > seq->n - q)))
+         die(rf, "the MD and NM of record %s are damaged", name);
+      if (type == 3) {
+         size_t from = at; /* reference bases before it are accounted for */
+         size_t c = at;
+         for (;;) {
+            if (seq_has_n) {
+               if (c == at + n)
+                  break;
+            } else {
+               while (diff < ndiffs && diff_pos < q)
+                  if (++diff < ndiffs)
+                     diff_pos += rf->diffs[diff] >> kDiffCodeBits;
+               const size_t d = diff < ndiffs && diff_pos < q + n ? at + (diff_pos - q) : SIZE_MAX;
+               const size_t p =
+                  patch < rf->npatches && (rf->patches[patch] >> 8) < at + n ? rf->patches[patch] >> 8 : SIZE_MAX;
+               c = d < p ? d : p;
+               if (c == SIZE_MAX)
+                  break;
+               if (c == d && ++diff < ndiffs)
+                  diff_pos += rf->diffs[diff] >> kDiffCodeBits;
+               if (c == p)
+                  ++patch;
+               if (c < from)
+                  continue;
+            }
+            const char base = ref[c];
+            if (seq->s[q + c - at] != base || base == 'N') {
+               put_number(rf, md, matches + c - from);
+               matches = 0;
+               put(rf, md, &base, 1);
+               ++nm;
+               from = c + 1;
+            }
+            if (seq_has_n)
+               ++c;
+         }
+         matches += at + n - from;
+      } else if (op == BAM_CDEL) {
+         put_number(rf, md, matches);
+         matches = 0;
+         put(rf, md, "^", 1);
+         put(rf, md, ref + at, n);
+         nm += (int64_t)n;
+      } else if (op == BAM_CINS) {
+         nm += (int64_t)n;
+      }
+      if (type & 1)
+         q += n;
+      if (type & 2)
+         at += n;
+      /* Patches under deletions and skips are no mismatches. */
+      while (patch < rf->npatches && (rf->patches[patch] >> 8) < at)
+         ++patch;
+   }
+   put_number(rf, md, matches);
+   reserve(rf, md, 1);
+   md->s[md->n] = '\0';
+   return nm;
 }
 
 static void block_free(Block *b)
@@ -864,6 +989,8 @@ static void open_file(RamFile *rf, const char *path)
    rnt_cursor(&rf->cons.blob_n, rf->f, rnt_column(rf->f, "consensus", 0));
    rnt_cursor(&rf->cons.blob, rf->f, rnt_column(rf->f, "consensus", 1));
    rnt_cursor(&rf->cons_pos, rf->f, rnt_column(rf->f, "consensus_pos", 0));
+   rnt_cursor(&rf->patch_n, rf->f, rnt_column(rf->f, "consensus_patch", 0));
+   rnt_cursor(&rf->patch, rf->f, rnt_column(rf->f, "consensus_patch._0", 0));
    check(rf, rf->f);
    start(rf, 0, -1, 0, 0);
 }
@@ -885,6 +1012,8 @@ static int next_record(RamFile *rf, bam1_t *b)
          rnt_seek(&rf->cons.blob_n, row);
          rnt_seek_items(&rf->cons.blob, &rf->cons.blob_n);
          rnt_seek(&rf->cons_pos, row);
+         rnt_seek(&rf->patch_n, row);
+         rnt_seek_items(&rf->patch, &rf->patch_n);
       }
       if (row == rf->block_start || row == rf->ends[rf->block - 1] + 1) {
          load_names(rf, rf->ends[rf->block] - row + 1);
@@ -976,6 +1105,16 @@ static int next_record(RamFile *rf, bam1_t *b)
       const int32_t tlen = wrap((int64_t)tlen_delta + predict_tlen(flag, pos, span, mpos, same_ref));
       if (flags & kSeqConsensus)
          decode_seq(rf, name, pos, (size_t)ncigar, (size_t)ndiffs);
+      if (flags & (kMdRebuilt | kNmRebuilt)) {
+         if (!(flags & kSeqConsensus))
+            die(rf, "record %s has MD or NM to rebuild but no consensus", name);
+         const int64_t nm =
+            make_md_nm(rf, name, pos, (size_t)ncigar, (size_t)ndiffs, flags & kMdRebuilt ? &rf->tag_str[0] : &rf->md);
+         if (nm > INT32_MAX)
+            die(rf, "the MD and NM of record %s are damaged", name);
+         if (flags & kNmRebuilt)
+            tag_int[0] = (int32_t)nm;
+      }
       const Str *seq = flags & kSeqConsensus ? &rf->seq : &rf->seq_lit;
       const size_t l_seq = seq->n == 1 && seq->s[0] == '*' ? 0 : seq->n;
 
@@ -1085,6 +1224,8 @@ void ram_close(RamFile *rf)
    block_free(&rf->quals);
    block_free(&rf->cons);
    rnt_cursor_free(&rf->cons_pos);
+   rnt_cursor_free(&rf->patch_n);
+   rnt_cursor_free(&rf->patch);
    rnt_cursor_free(&rf->mc);
    str_free(&rf->ms);
    if (rf->meta)
@@ -1095,8 +1236,8 @@ void ram_close(RamFile *rf)
    Strings *all[] = {&rf->lines, &rf->rnames, &rf->rnexts, &rf->orders, &rf->rg, &rf->pg};
    for (size_t i = 0; i < sizeof all / sizeof *all; ++i)
       strings_free(all[i]);
-   Str *strs[] = {&rf->seq,        &rf->seq_lit,    &rf->qual,       &rf->text,
-                  &rf->tag_str[0], &rf->tag_str[1], &rf->tag_str[2], &rf->tag_str[3]};
+   Str *strs[] = {&rf->seq,        &rf->seq_lit,    &rf->qual,       &rf->text, &rf->tag_str[0],
+                  &rf->tag_str[1], &rf->tag_str[2], &rf->tag_str[3], &rf->ref,  &rf->md};
    for (size_t i = 0; i < sizeof strs / sizeof *strs; ++i)
       free(strs[i]->s);
    free(rf->tids);
@@ -1104,6 +1245,7 @@ void ram_close(RamFile *rf)
    free(rf->ends);
    free(rf->cigar);
    free(rf->diffs);
+   free(rf->patches);
    free(rf->array);
    free(rf->values);
    free(rf->varints);
