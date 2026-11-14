@@ -111,21 +111,6 @@ as 1000 to the end of `chr1`.
 ./build/tools/ramstats size reads.ram            # bytes each field takes, as samtools cram-size
 ```
 
-## Check a RAM file against samtools
-
-Every result can be compared with samtools. None of these print anything when
-the RAM file matches:
-
-```bash
-diff <(./build/tools/ramdump -h reads.ram) <(samtools view -h --no-PG reads.sorted.bam)
-diff <(./build/tools/ramstats idxstats reads.ram) <(samtools idxstats reads.sorted.bam)
-diff <(./build/tools/ramstats flagstat reads.ram) <(samtools flagstat reads.sorted.bam)
-diff <(./build/tools/ramdump -c reads.ram chr1:10000-20000) <(samtools view -c reads.sorted.bam chr1:10000-20000)
-```
-
-`samtools idxstats` and region queries need the BAM index:
-`samtools index reads.sorted.bam`.
-
 ## Versioning
 
 RAM follows [Semantic Versioning](https://semver.org); [CHANGELOG.md](CHANGELOG.md)
