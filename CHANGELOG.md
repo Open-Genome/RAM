@@ -43,6 +43,10 @@ the README for what that means before 1.0.
 
 ### Changed
 
+- `bamtoramntuple` copies each record's CIGAR from BAM and decodes SEQ two
+  bases a byte, instead of writing both as SAM text and parsing them back.
+  Conversion of the 5 Mb chr20 slices is 4 to 10% faster at 1 and 4 threads,
+  and the files are the same.
 - SEQ is stored as differences from a consensus of each block of records, as
   CRAM's `embed_ref=2` slices store it: the block's last row carries the
   commonest base at every position its aligned reads cover, and each aligned
